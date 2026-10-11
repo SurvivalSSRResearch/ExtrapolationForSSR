@@ -1,0 +1,3624 @@
+---
+title: "Fixed Follow-up Design H1: Unblinded Nonparametric Extrapolation - Diff Mean and Diff Last"
+output: html_document
+---
+
+```{r setup_helpers, echo=TRUE}
+# Helper functions
+draw_close_parameters <- function(center, rel_sd = 1e-5, abs_sd = 1e-6) {
+  center <- as.numeric(center)
+  if (length(center) == 0L || any(!is.finite(center))) return(center)
+
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_seed) old_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+
+  seed_value <- as.integer((sum(abs(center) * 1e6) + 104729 * length(center)) %% 2147483000)
+  if (!is.finite(seed_value) || seed_value <= 0L) seed_value <- 104729L
+  set.seed(seed_value)
+
+  sd_vec <- pmax(abs(center) * rel_sd, abs_sd)
+  out <- rnorm(length(center), mean = center, sd = sd_vec)
+
+  if (had_seed) {
+    assign(".Random.seed", old_seed, envir = .GlobalEnv)
+  } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+    rm(".Random.seed", envir = .GlobalEnv)
+  }
+
+  out
+}
+
+
+local_rnorm <- function(n, mean, sd, seed, lower = -Inf, upper = Inf) {
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_seed) old_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  set.seed(as.integer(seed))
+  out <- rnorm(n, mean = mean, sd = sd)
+  out <- pmin(pmax(out, lower), upper)
+  if (had_seed) {
+    assign(".Random.seed", old_seed, envir = .GlobalEnv)
+  } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+    rm(".Random.seed", envir = .GlobalEnv)
+  }
+  out
+}
+
+draw_normal_trend <- function(n, start, end, sd, seed,
+                              lower = -Inf, upper = Inf) {
+  mu <- seq(start, end, length.out = n)
+  local_rnorm(n, mean = mu, sd = sd, seed = seed,
+              lower = lower, upper = upper)
+}
+
+draw_normal_level <- function(n, mean, sd, seed,
+                              lower = -Inf, upper = Inf) {
+  local_rnorm(n, mean = rep(mean, n), sd = sd, seed = seed,
+              lower = lower, upper = upper)
+}
+
+draw_control_value <- function(mean, sd, seed,
+                               lower = -Inf, upper = Inf) {
+  local_rnorm(1L, mean = mean, sd = sd, seed = seed,
+              lower = lower, upper = upper)[1]
+}
+
+local_runif <- function(n, min, max, seed) {
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_seed) old_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  set.seed(as.integer(seed))
+  out <- runif(n, min = min, max = max)
+  if (had_seed) {
+    assign(".Random.seed", old_seed, envir = .GlobalEnv)
+  } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+    rm(".Random.seed", envir = .GlobalEnv)
+  }
+  out
+}
+
+draw_uniform_range <- function(n, min, max, seed, decreasing = FALSE) {
+  sort(local_runif(n, min, max, seed), decreasing = decreasing)
+}
+
+draw_uniform_value <- function(min, max, seed) {
+  local_runif(1L, min, max, seed)[1]
+}
+
+generate_gl20 <- function() {
+  n <- 20L
+
+  legendre_pair <- function(n, x) {
+    p0 <- rep(1, length(x))
+    if (n == 0L) return(list(pn = p0, pnm1 = rep(0, length(x))))
+    p1 <- x
+    if (n == 1L) return(list(pn = p1, pnm1 = p0))
+    for (k in 2:n) {
+      pk <- ((2 * k - 1) * x * p1 - (k - 1) * p0) / k
+      p0 <- p1
+      p1 <- pk
+    }
+    list(pn = p1, pnm1 = p0)
+  }
+
+  k <- seq_len(n)
+  x <- cos(pi * (4 * k - 1) / (4 * n + 2))
+  for (iter in 1:8) {
+    pp <- legendre_pair(n, x)
+    dp <- n * (x * pp$pn - pp$pnm1) / (x^2 - 1)
+    x <- x - pp$pn / dp
+  }
+  x <- sort(x)
+  pp <- legendre_pair(n, x)
+  dp <- n * (x * pp$pn - pp$pnm1) / (x^2 - 1)
+  w <- 2 / ((1 - x^2) * dp^2)
+
+  x <- local_rnorm(n, mean = x, sd = 1e-12, seed = 91021,
+                   lower = -1 + 1e-12, upper = 1 - 1e-12)
+  x <- sort(x)
+  w <- local_rnorm(n, mean = w, sd = 1e-12, seed = 91022,
+                   lower = .Machine$double.eps, upper = Inf)
+  w <- 2 * w / sum(w)
+
+  list(x = x, w = w)
+}
+
+```
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, error=TRUE}
+suppressPackageStartupMessages({
+  library(openxlsx)
+  library(survival)
+  library(stats)
+  library(dplyr)
+  library(gsDesign)
+  library(flexsurv)
+})
+
+compiler::enableJIT(3)
+
+Sys.setenv(
+  OMP_NUM_THREADS = "1",
+  OPENBLAS_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1",
+  VECLIB_MAXIMUM_THREADS = "1",
+  NUMEXPR_NUM_THREADS = "1"
+)
+
+set.seed(1234567)
+
+FIXED_FOLLOWUP <- 5
+
+apply_calendar_end <- function(df, L) {
+  out <- df[df$rec_time <= L, , drop = FALSE]
+  out$time <- pmin(out$study_time, L) - out$rec_time
+  out$cens <- as.integer(out$study_time <= L)
+  out
+}
+
+
+apply_fixed_followup <- function(df, fixed_followup) {
+  out <- df
+  out$cens <- as.integer(out$event_time <= fixed_followup)
+  out$time <- pmin(out$event_time, fixed_followup)
+  out$time[out$time < 0] <- 0
+  out
+}
+
+stage2_logrank_fixed_followup <- function(final_pool, interim_time, fixed_followup) {
+  event_cal  <- final_pool$study_time
+  censor_cal <- final_pool$rec_time + fixed_followup
+  exit_cal   <- pmin(event_cal, censor_cal)
+  event_obs  <- as.integer(final_pool$event_time <= fixed_followup)
+
+  stage2_event_times <- sort(unique(
+    event_cal[event_obs == 1L & event_cal > interim_time]
+  ))
+
+  if (length(stage2_event_times) == 0L) {
+    return(list(U2 = 0, I2 = 0))
+  }
+
+  U2 <- 0
+  I2 <- 0
+
+  for (tt in stage2_event_times) {
+    at_risk <- final_pool$rec_time <= tt & exit_cal >= tt
+
+    Y1 <- sum(at_risk & final_pool$group == 1)
+    Y2 <- sum(at_risk & final_pool$group == 2)
+    Y  <- Y1 + Y2
+
+    is_event <- event_obs == 1L & event_cal == tt
+    d1 <- sum(is_event & final_pool$group == 1)
+    d2 <- sum(is_event & final_pool$group == 2)
+    d  <- d1 + d2
+
+    if (Y > 1 && d > 0) {
+      U2 <- U2 + d2 - d * Y2 / Y
+      I2 <- I2 + (Y1 * Y2 * d * (Y - d)) / (Y^2 * (Y - 1))
+    }
+  }
+
+  list(U2 = U2, I2 = I2)
+}
+
+make_gs_design <- function(d_half, d, alpha_one_sided, beta) {
+  gsDesign(
+    k = 2,
+    test.type = 1,
+    alpha = alpha_one_sided,
+    beta = beta,
+    n.I = c(d_half, d),
+    sfu = sfPoints,
+    sfupar = c(0, 1),
+    delta0 = 0,
+    delta1 = 1
+  )
+}
+
+gs_cond_power <- function(z1_gs, D_total, x_gs, theta = NULL) {
+  n2 <- D_total - x_gs$n.I[1]
+  if (!is.finite(z1_gs) || !is.finite(n2) || n2 <= 0) return(NA_real_)
+
+  as.numeric(condPower(
+    z1 = z1_gs,
+    n2 = n2,
+    z2 = z2NC,
+    theta = theta,
+    x = x_gs
+  ))
+}
+
+find_D_for_target_cp_gs <- function(target_cp, z1_gs, x_gs, D_min, D_max,
+                                    theta = NULL) {
+  cp_min <- gs_cond_power(z1_gs, D_min, x_gs, theta)
+  if (is.finite(cp_min) && cp_min >= target_cp) return(D_min)
+
+  cp_max <- gs_cond_power(z1_gs, D_max, x_gs, theta)
+  if (!is.finite(cp_max) || cp_max < target_cp) return(D_max)
+
+  f <- function(D) gs_cond_power(z1_gs, D, x_gs, theta) - target_cp
+  uniroot(f, lower = D_min, upper = D_max)$root
+}
+
+
+logrank_theta_from_survival <- function(S_control, S_treatment, t_max,
+                                        n_grid = 100L) {
+  if (is.null(S_control) || !is.function(S_control) ||
+      is.null(S_treatment) || !is.function(S_treatment) ||
+      !is.finite(t_max) || t_max <= 0) {
+    return(NA_real_)
+  }
+
+  tt <- seq(0, t_max, length.out = as.integer(n_grid) + 1L)
+
+  S1 <- tryCatch(as.numeric(S_control(tt)), error = function(e) rep(NA_real_, length(tt)))
+  S2 <- tryCatch(as.numeric(S_treatment(tt)), error = function(e) rep(NA_real_, length(tt)))
+
+  if (length(S1) != length(tt) || length(S2) != length(tt) ||
+      any(!is.finite(S1)) || any(!is.finite(S2))) {
+    return(NA_real_)
+  }
+
+  S1 <- cummin(pmin(pmax(S1, 0), 1))
+  S2 <- cummin(pmin(pmax(S2, 0), 1))
+
+  Y1 <- S1[-length(S1)]
+  Y2 <- S2[-length(S2)]
+
+  dN1 <- pmax(S1[-length(S1)] - S1[-1], 0)
+  dN2 <- pmax(S2[-length(S2)] - S2[-1], 0)
+  dN  <- dN1 + dN2
+
+  Ytot <- Y1 + Y2
+  ok <- is.finite(Ytot) & (Ytot > 1e-12) &
+        is.finite(dN) & (dN >= 0)
+
+  if (!any(ok)) return(NA_real_)
+
+  Y1 <- Y1[ok]
+  Y2 <- Y2[ok]
+  dN1 <- dN1[ok]
+  dN2 <- dN2[ok]
+  dN <- dN[ok]
+  Ytot <- Ytot[ok]
+
+  U_trt <- sum(dN2 - (Y2 / Ytot) * dN)
+
+  V_lr <- sum((Y1 * Y2 / (Ytot^2)) * dN)
+  D_lr <- sum(dN)
+
+  if (!is.finite(U_trt) || !is.finite(V_lr) || !is.finite(D_lr) ||
+      V_lr <= 0 || D_lr <= 0) {
+    return(NA_real_)
+  }
+
+  theta_lr <- (-U_trt) / sqrt(V_lr * D_lr)
+
+  if (!is.finite(theta_lr)) NA_real_ else theta_lr
+}
+
+
+analytic_chw_cp_vector <- function(target_events, interim_events,
+                                   z1_gs, x_gs, theta_logrank) {
+  target_events <- as.numeric(target_events)
+  nout <- length(target_events)
+
+  zcrit2 <- tryCatch(
+    as.numeric(z2NC(z1 = z1_gs, x = x_gs)),
+    error = function(e) NA_real_
+  )
+
+  D2 <- target_events - interim_events
+  mu_z2 <- rep(NA_real_, nout)
+  cp <- rep(NA_real_, nout)
+
+  ok <- is.finite(target_events) & is.finite(D2) & (D2 > 0) &
+        is.finite(theta_logrank) & is.finite(zcrit2)
+
+  if (any(ok)) {
+    mu_z2[ok] <- theta_logrank * sqrt(D2[ok])
+    cp[ok] <- pnorm(mu_z2[ok] - zcrit2)
+  }
+
+  data.frame(
+    target_events = target_events,
+    D2 = D2,
+    mu_z2 = mu_z2,
+    cp = cp
+  )
+}
+
+S_pieceweib <- function(t, shape_pre, scale_pre, shape_post, scale_post, c) {
+  t <- pmax(t, 0)
+  c <- pmax(c, 0)
+
+  if (c <= 0) {
+    return(exp(- (t / scale_post)^shape_post))
+  }
+
+  H1c <- (c / scale_pre)^shape_pre
+  out <- numeric(length(t))
+
+  idx1 <- t <= c
+  idx2 <- !idx1
+
+  if (any(idx1)) {
+    out[idx1] <- exp(- (t[idx1] / scale_pre)^shape_pre)
+  }
+  if (any(idx2)) {
+    out[idx2] <- exp(- (H1c + ((t[idx2] - c) / scale_post)^shape_post))
+  }
+
+  out
+}
+
+kth_event_cut <- function(study_times, k) {
+  if (!is.finite(k) || k < 1) return(NA_real_)
+  kk <- ceiling(k)
+  st <- study_times[is.finite(study_times)]
+  if (length(st) < kk) return(NA_real_)
+  sort(st, partial = kk)[kk]
+}
+
+
+mst_from_S <- function(S_fun, t_max, n_grid = 300) {
+  if (is.null(S_fun) || !is.function(S_fun) || !is.finite(t_max) || t_max <= 0) {
+    return(NA_real_)
+  }
+  t_grid <- seq(0, t_max, length.out = n_grid)
+  S_vals <- tryCatch(as.numeric(S_fun(t_grid)), error = function(e) rep(NA_real_, length(t_grid)))
+  if (length(S_vals) != length(t_grid) || any(!is.finite(S_vals)) ||
+      any(S_vals < -1e-8) || any(S_vals > 1 + 1e-8) ||
+      any(diff(S_vals) > 1e-8)) return(NA_real_)
+  S_vals <- pmin(pmax(S_vals, 0), 1)
+  sum(diff(t_grid) * head(S_vals, -1))
+}
+
+
+rmst_from_S <- function(S_fun, tau, n_grid = 300) {
+  if (is.null(S_fun) || !is.function(S_fun) || !is.finite(tau) || tau <= 0) {
+    return(NA_real_)
+  }
+  t_grid <- seq(0, tau, length.out = n_grid)
+  S_vals <- tryCatch(as.numeric(S_fun(t_grid)), error = function(e) rep(NA_real_, length(t_grid)))
+  if (length(S_vals) != length(t_grid) || any(!is.finite(S_vals)) ||
+      any(S_vals < -1e-8) || any(S_vals > 1 + 1e-8) ||
+      any(diff(S_vals) > 1e-8)) return(NA_real_)
+  S_vals <- pmin(pmax(S_vals, 0), 1)
+  sum(diff(t_grid) * head(S_vals, -1))
+}
+
+
+theta_bar <- function(sf_obj, lam_assume, tmax) {
+  if (is.null(sf_obj$time) || length(sf_obj$time) == 0 ||
+      is.null(sf_obj$n.event) || sum(sf_obj$n.event, na.rm = TRUE) == 0 ||
+      !is.finite(tmax) || tmax <= 0) {
+    return(0)
+  }
+
+  eps_t <- .Machine$double.eps^(1/4)
+  ts <- (1:5) * (tmax / 5)
+  ts <- pmax(ts, eps_t)
+
+  s_new <- suppressWarnings(as.numeric(summary(sf_obj, times = ts, extend = TRUE)$surv))
+  s_old <- exp(-lam_assume * ts)
+
+  eps <- 1e-8
+  s_new <- pmin(pmax(s_new, eps), 1 - eps)
+  s_old <- pmin(pmax(s_old, eps), 1 - eps)
+
+  thetas <- -log(-log(s_new)) + log(-log(s_old))
+  mean(thetas[is.finite(thetas)], na.rm = TRUE)
+}
+
+theta_last_review <- function(sf_obj, lam_assume, arm_time, arm_cens) {
+  if (length(arm_time) == 0) return(0)
+  t_star <- max(arm_time, na.rm = TRUE)
+  if (!is.finite(t_star) || t_star <= 0) return(0)
+
+  s_new <- suppressWarnings(as.numeric(summary(sf_obj, times = t_star, extend = TRUE)$surv))
+  if (!is.finite(s_new) || length(s_new) == 0) return(0)
+
+  s_old <- exp(-lam_assume * t_star)
+
+  eps <- 1e-8
+  s_new <- pmin(pmax(s_new, eps), 1 - eps)
+  s_old <- pmin(pmax(s_old, eps), 1 - eps)
+
+  theta <- -log(-log(s_new)) + log(-log(s_old))
+  if (!is.finite(theta)) theta <- 0
+  theta
+}
+
+S_hat_theta <- function(t, lam_assume, theta) {
+  t <- pmax(t, 0)
+  Sold <- exp(-lam_assume * t)
+  eps <- 1e-12
+  Sold <- pmin(pmax(Sold, eps), 1 - eps)
+  exp(-exp(log(-log(Sold)) - theta))
+}
+
+fast_gl20_surv_area <- local({
+  gl20_local <- generate_gl20()
+  gl20_x_local <- gl20_local$x
+  gl20_w_local <- gl20_local$w
+  rm(gl20_local)
+
+  function(S_fun, t) {
+    t <- pmax(as.numeric(t), 0)
+    out <- rep(NA_real_, length(t))
+    ok <- is.finite(t)
+
+    if (!any(ok)) return(out)
+
+    xout <- t[ok]
+    vals <- numeric(length(xout))
+    positive <- xout > 0
+
+    if (any(positive)) {
+      tp <- xout[positive]
+      vals_pos <- vapply(
+        tp,
+        function(upper) {
+          mid <- upper / 2
+          xx <- mid * (gl20_x_local + 1)
+          ss <- S_fun(xx)
+          if (length(ss) != length(xx) || any(!is.finite(ss))) return(NA_real_)
+          mid * sum(gl20_w_local * ss)
+        },
+        numeric(1)
+      )
+      vals[positive] <- vals_pos
+    }
+
+    out[ok] <- vals
+    out
+  }
+})
+make_theta_extrapolation <- function(sf_obj, arm_time, arm_cens,
+                                     lam_assume, extrap_method) {
+  extrap_method <- tolower(extrap_method)
+  if (extrap_method == "diff_mean") {
+    tmax <- max(arm_time)
+    theta <- theta_bar(sf_obj, lam_assume, tmax)
+  } else if (extrap_method == "diff_last") {
+    theta <- theta_last_review(sf_obj, lam_assume, arm_time, arm_cens)
+  } else stop("Unsupported extrapolation method: ", extrap_method,
+              ". Choose diff_mean or diff_last.")
+
+  theta_fun <- function(t) S_hat_theta(t, lam_assume, theta)
+
+  rate_eff <- lam_assume * exp(-theta)
+  theta_area <- function(t) {
+    t <- pmax(as.numeric(t),0)
+    if (!is.finite(rate_eff) || rate_eff <= 0)
+      return(fast_gl20_surv_area(theta_fun,t))
+    -expm1(-rate_eff*t)/rate_eff
+  }
+  attr(theta_fun,"cum_surv_area") <- theta_area
+  theta_fun
+}
+
+valid_survival_function <- function(S_fun, t_max, n_grid = 50L, tol = 1e-8) {
+  if (is.null(S_fun) || !is.function(S_fun) || !is.finite(t_max) || t_max <= 0) {
+    return(FALSE)
+  }
+  tt <- seq(0, t_max, length.out = n_grid)
+  ss <- tryCatch(as.numeric(S_fun(tt)), error = function(e) rep(NA_real_, length(tt)))
+  if (length(ss) != length(tt) || any(!is.finite(ss))) return(FALSE)
+  if (any(ss < -tol) || any(ss > 1 + tol)) return(FALSE)
+  if (any(diff(ss) > tol)) return(FALSE)
+  TRUE
+}
+
+get_arm_event_prob_future_full <- function(arm_df, L_end, S_fun) {
+  if (is.null(S_fun) || !is.function(S_fun)) return(NA_real_)
+
+  eps <- 1e-12
+  t_obs <- pmax(arm_df$time, 0)
+  t_end <- pmax(L_end - arm_df$rec_time, 0)
+  t_end <- pmax(t_end, t_obs)
+
+  n_arm <- length(t_obs)
+  ss <- S_fun(c(t_obs, t_end))
+  if (length(ss) != 2L * n_arm) return(NA_real_)
+  S_obs <- ss[seq_len(n_arm)]
+  S_end <- ss[n_arm + seq_len(n_arm)]
+
+  S_obs <- pmin(pmax(S_obs, eps), 1)
+  S_end <- pmin(pmax(S_end, eps), 1)
+
+  p_j <- rep(NA_real_, nrow(arm_df))
+  is_event <- arm_df$cens == 1
+  p_j[is_event] <- 1
+  is_cens <- !is_event
+  if (any(is_cens)) p_j[is_cens] <- 1 - S_end[is_cens] / S_obs[is_cens]
+
+  p_j[!is.finite(p_j)] <- NA_real_
+  p_j <- pmin(pmax(p_j, 0), 1)
+  if (all(is.na(p_j))) return(NA_real_)
+  mean(p_j, na.rm = TRUE)
+}
+
+true_mst_pieceweib <- function(shape_pre, scale_pre, shape_post, scale_post, c) {
+  c <- pmax(c, 0)
+  if (c <= 0) {
+    return(scale_post * gamma(1 + 1/shape_post))
+  }
+
+  H1c <- (c / scale_pre)^shape_pre
+  k   <- 1 / shape_pre
+
+  int1 <- (scale_pre / shape_pre) * gamma(k) * pgamma(H1c, shape = k, rate = 1)
+
+  int2 <- exp(-H1c) * scale_post * gamma(1 + 1/shape_post)
+
+  int1 + int2
+}
+
+clamp <- function(x, lo, hi) {
+  pmin(pmax(x, lo), hi)
+}
+
+
+validate_piecewise_weibull_label <- function(pattern, pars,
+                                              change_point = 1,
+                                              horizon = 5,
+                                              tol = 1e-6) {
+  if (!pattern %in% c("crossing", "diverging", "PH", "diminishing")) {
+    return(invisible(TRUE))
+  }
+
+  req <- c("c_shape_pre", "c_shape_post", "c_scale_pre", "c_scale_post",
+           "t_shape_pre", "t_shape_post", "t_scale_pre", "t_scale_post")
+  if (!all(req %in% names(pars))) {
+    stop("Piecewise-Weibull label validation: missing parameter(s): ",
+         paste(setdiff(req, names(pars)), collapse = ", "))
+  }
+  pv <- unlist(pars[req], use.names = FALSE)
+  if (any(!is.finite(pv)) || any(pv <= 0)) {
+    stop("Piecewise-Weibull label validation: all shape/scale parameters must be positive and finite.")
+  }
+
+  pre_t  <- seq(max(1e-4, 0.05 * change_point),
+                max(2e-4, 0.95 * change_point), length.out = 200)
+  post_u <- seq(max(1e-4, 0.02 * (horizon - change_point)),
+                max(2e-4, 0.98 * (horizon - change_point)), length.out = 300)
+
+  weib_h <- function(x, shape, scale) {
+    (shape / scale) * (x / scale)^(shape - 1)
+  }
+
+  hr_pre <- weib_h(pre_t, pars$t_shape_pre, pars$t_scale_pre) /
+            weib_h(pre_t, pars$c_shape_pre, pars$c_scale_pre)
+  hr_post <- weib_h(post_u, pars$t_shape_post, pars$t_scale_post) /
+             weib_h(post_u, pars$c_shape_post, pars$c_scale_post)
+
+  if (any(!is.finite(hr_pre)) || any(!is.finite(hr_post))) {
+    stop("Piecewise-Weibull label validation produced non-finite true hazard ratios for ", pattern, ".")
+  }
+
+  hr_pre_mid  <- exp(median(log(hr_pre)))
+  hr_post_mid <- exp(median(log(hr_post)))
+
+  ok <- switch(
+    pattern,
+    crossing = (hr_pre_mid > 1 + tol && hr_post_mid < 1 - tol),
+    diverging = (hr_pre_mid < 1 - tol && hr_post_mid < hr_pre_mid - tol),
+    PH = {
+      all_hr <- c(hr_pre, hr_post)
+      max(abs(log(all_hr) - mean(log(all_hr)))) < 1e-5
+    },
+    diminishing = (hr_pre_mid < 1 - tol && hr_post_mid < 1 - tol &&
+                   hr_post_mid > hr_pre_mid + tol)
+  )
+
+  if (pattern == "crossing" && ok) {
+    tt <- seq(1e-4, horizon, length.out = 2000)
+    Sc <- S_pieceweib(tt,
+      pars$c_shape_pre, pars$c_scale_pre,
+      pars$c_shape_post, pars$c_scale_post, change_point)
+    St <- S_pieceweib(tt,
+      pars$t_shape_pre, pars$t_scale_pre,
+      pars$t_shape_post, pars$t_scale_post, change_point)
+    dd <- St - Sc
+    ok <- any(dd < -tol) && any(dd > tol)
+  }
+
+  if (!ok) {
+    stop(
+      "Piecewise-Weibull DGM label check FAILED for '", pattern, "'. ",
+      "Representative true HR_pre=", signif(hr_pre_mid, 5),
+      ", HR_post=", signif(hr_post_mid, 5),
+      if (pattern == "crossing") "; true survival curves did not satisfy the required crossing pattern within follow-up." else ".",
+      " Check the final post-calibration treatment parameters before running simulations."
+    )
+  }
+
+  invisible(TRUE)
+}
+
+rweibull_piecewise <- function(n,
+                               shape_pre, scale_pre,
+                               shape_post, scale_post,
+                               c) {
+  if (c <= 0) {
+    return(rweibull(n, shape = shape_post, scale = scale_post))
+  }
+
+  u  <- runif(n)
+  z  <- -log(u)
+
+  H1c <- (c / scale_pre)^shape_pre
+
+  t   <- numeric(n)
+
+  idx1 <- z <= H1c
+  if (any(idx1)) {
+    t[idx1] <- scale_pre * (z[idx1])^(1 / shape_pre)
+  }
+
+  idx2 <- !idx1
+  if (any(idx2)) {
+    z2   <- z[idx2] - H1c
+    t[idx2] <- c + scale_post * (z2)^(1 / shape_post)
+  }
+
+  t
+}
+
+
+average_event_probability_true <- function(S_fun, analysis_time, accrual_length) {
+  if (!is.function(S_fun) || !is.finite(analysis_time) || analysis_time < 0) {
+    return(NA_real_)
+  }
+  if (analysis_time == 0) {
+    return(0)
+  }
+  if (!is.finite(accrual_length) || accrual_length <= 0) {
+    return(1 - S_fun(analysis_time))
+  }
+  val <- tryCatch(
+    integrate(
+      function(u) 1 - S_fun(pmax(analysis_time - u, 0)),
+      lower = 0, upper = accrual_length,
+      subdivisions = 1000L, rel.tol = 1e-8
+    )$value / accrual_length,
+    error = function(e) NA_real_
+  )
+  pmin(pmax(val, 0), 1)
+}
+
+
+average_future_event_probability <- function(
+    S_fun, L, accrual_start, accrual_end) {
+
+  if (!is.function(S_fun) || !is.finite(L) ||
+      !is.finite(accrual_start) || !is.finite(accrual_end)) return(NA_real_)
+  if (accrual_end < accrual_start) return(NA_real_)
+
+  if (accrual_end == accrual_start) {
+    if (L < accrual_start) return(0)
+    val <- 1 - S_fun(pmax(L - accrual_start, 0))
+    return(pmin(pmax(as.numeric(val), 0), 1))
+  }
+
+  upper_enroll <- min(accrual_end, L)
+  if (upper_enroll <= accrual_start) return(0)
+
+  area_fun <- attr(S_fun, "cum_surv_area", exact = TRUE)
+  if (is.function(area_fun)) {
+    x_lo <- pmax(L - upper_enroll, 0)
+    x_hi <- pmax(L - accrual_start, 0)
+    aa <- tryCatch(area_fun(c(x_lo, x_hi)), error=function(e)c(NA_real_,NA_real_))
+    if (length(aa)==2L && all(is.finite(aa))) {
+      surv_area <- aa[2] - aa[1]
+      event_integral <- (upper_enroll - accrual_start) - surv_area
+      val <- event_integral / (accrual_end - accrual_start)
+      return(pmin(pmax(as.numeric(val), 0), 1))
+    }
+  }
+
+  val <- tryCatch(
+    integrate(function(u) 1 - S_fun(pmax(L-u,0)),
+              lower=accrual_start, upper=upper_enroll,
+              subdivisions=200L, rel.tol=1e-6)$value /
+      (accrual_end-accrual_start),
+    error=function(e) NA_real_)
+  pmin(pmax(val,0),1)
+}
+
+predict_final_event_time <- function(
+    interim_data, interim_time,
+    S_control, S_treatment,
+    target_events,
+    n1_total, n2_total,
+    accrual_length,
+    n_add = 0L,
+    add_accrual_start = interim_time,
+    add_accrual_end = interim_time) {
+
+  if (!is.data.frame(interim_data) ||
+      !all(c("time", "cens", "rec_time", "group") %in% names(interim_data)) ||
+      !is.function(S_control) || !is.function(S_treatment) ||
+      !is.finite(interim_time) || interim_time < 0 ||
+      !is.finite(target_events) || target_events < 1 ||
+      !is.finite(n1_total) || !is.finite(n2_total) ||
+      !is.finite(accrual_length) || accrual_length < 0 ||
+      !is.finite(n_add) || n_add < 0 ||
+      !is.finite(add_accrual_start) || !is.finite(add_accrual_end) ||
+      add_accrual_start < interim_time ||
+      add_accrual_end < add_accrual_start) {
+    return(NA_real_)
+  }
+
+  n_add <- as.integer(round(n_add))
+  n_add_1 <- n_add %/% 2L
+  n_add_2 <- n_add - n_add_1
+
+  n_enrolled_1 <- sum(interim_data$group == 1)
+  n_enrolled_2 <- sum(interim_data$group == 2)
+  n_future_1 <- max(as.integer(round(n1_total)) - n_enrolled_1, 0L)
+  n_future_2 <- max(as.integer(round(n2_total)) - n_enrolled_2, 0L)
+
+  idx1 <- which(interim_data$group == 1)
+  idx2 <- which(interim_data$group == 2)
+
+  idx1_event <- idx1[interim_data$cens[idx1] == 1]
+  idx2_event <- idx2[interim_data$cens[idx2] == 1]
+  idx1_cens  <- idx1[interim_data$cens[idx1] == 0]
+  idx2_cens  <- idx2[interim_data$cens[idx2] == 0]
+
+  n_existing_events <- length(idx1_event) + length(idx2_event)
+
+  t_obs1 <- pmax(interim_data$time[idx1_cens], 0)
+  t_obs2 <- pmax(interim_data$time[idx2_cens], 0)
+  rec1 <- interim_data$rec_time[idx1_cens]
+  rec2 <- interim_data$rec_time[idx2_cens]
+
+  S_obs1 <- if (length(idx1_cens) > 0L) {
+    tryCatch(as.numeric(S_control(t_obs1)),
+             error = function(e) rep(NA_real_, length(t_obs1)))
+  } else numeric(0)
+
+  S_obs2 <- if (length(idx2_cens) > 0L) {
+    tryCatch(as.numeric(S_treatment(t_obs2)),
+             error = function(e) rep(NA_real_, length(t_obs2)))
+  } else numeric(0)
+
+  if ((length(S_obs1) != length(idx1_cens)) ||
+      (length(S_obs2) != length(idx2_cens)) ||
+      any(!is.finite(S_obs1)) || any(!is.finite(S_obs2)) ||
+      any(S_obs1 <= 0) || any(S_obs2 <= 0)) {
+    return(NA_real_)
+  }
+
+  expected_events <- function(L) {
+    if (!is.finite(L) || L < interim_time) return(NA_real_)
+
+    total <- as.numeric(n_existing_events)
+
+    if (length(idx1_cens) > 0L) {
+      t_end1 <- pmax(L - rec1, t_obs1)
+      S_end1 <- tryCatch(as.numeric(S_control(t_end1)),
+                         error = function(e) rep(NA_real_, length(t_end1)))
+      if (length(S_end1) != length(idx1_cens) || any(!is.finite(S_end1))) {
+        return(NA_real_)
+      }
+      p1 <- pmin(pmax(1 - S_end1 / S_obs1, 0), 1)
+      total <- total + sum(p1)
+    }
+
+    if (length(idx2_cens) > 0L) {
+      t_end2 <- pmax(L - rec2, t_obs2)
+      S_end2 <- tryCatch(as.numeric(S_treatment(t_end2)),
+                         error = function(e) rep(NA_real_, length(t_end2)))
+      if (length(S_end2) != length(idx2_cens) || any(!is.finite(S_end2))) {
+        return(NA_real_)
+      }
+      p2 <- pmin(pmax(1 - S_end2 / S_obs2, 0), 1)
+      total <- total + sum(p2)
+    }
+
+    if (n_future_1 > 0L) {
+      if (accrual_length <= interim_time) return(NA_real_)
+      p <- average_future_event_probability(
+        S_control, L, interim_time, accrual_length
+      )
+      if (!is.finite(p)) return(NA_real_)
+      total <- total + n_future_1 * p
+    }
+
+    if (n_future_2 > 0L) {
+      if (accrual_length <= interim_time) return(NA_real_)
+      p <- average_future_event_probability(
+        S_treatment, L, interim_time, accrual_length
+      )
+      if (!is.finite(p)) return(NA_real_)
+      total <- total + n_future_2 * p
+    }
+
+    if (n_add_1 > 0L) {
+      p <- average_future_event_probability(
+        S_control, L, add_accrual_start, add_accrual_end
+      )
+      if (!is.finite(p)) return(NA_real_)
+      total <- total + n_add_1 * p
+    }
+
+    if (n_add_2 > 0L) {
+      p <- average_future_event_probability(
+        S_treatment, L, add_accrual_start, add_accrual_end
+      )
+      if (!is.finite(p)) return(NA_real_)
+      total <- total + n_add_2 * p
+    }
+
+    total
+  }
+
+  f_lower <- expected_events(interim_time) - target_events
+  if (!is.finite(f_lower)) return(NA_real_)
+  if (f_lower >= 0) return(interim_time)
+
+  upper <- max(
+    interim_time + 1,
+    accrual_length + 1,
+    add_accrual_end + 1
+  )
+
+  f_upper <- expected_events(upper) - target_events
+  n_expand <- 0L
+  while ((!is.finite(f_upper) || f_upper < 0) && n_expand < 60L) {
+    upper <- interim_time + 2 * (upper - interim_time)
+    f_upper <- expected_events(upper) - target_events
+    n_expand <- n_expand + 1L
+  }
+
+  if (!is.finite(f_upper) || f_upper < 0) return(NA_real_)
+
+  tryCatch(
+    uniroot(
+      function(L) expected_events(L) - target_events,
+      lower = interim_time,
+      upper = upper,
+      tol = 1e-5
+    )$root,
+    error = function(e) NA_real_
+  )
+}
+
+expected_stage2_logrank_at_time <- function(
+    interim_data, interim_time, final_time,
+    S_control, S_treatment,
+    n1_total, n2_total, accrual_length,
+    n_add = 0L, add_accrual_length = 0,
+    add_accrual_start = interim_time,
+    fixed_followup = FIXED_FOLLOWUP,
+    n_grid = 30L, n_accrual_grid = 10L, return_path = FALSE) {
+
+  if (!is.data.frame(interim_data) ||
+      !all(c("time", "cens", "rec_time", "group") %in% names(interim_data)) ||
+      !is.function(S_control) || !is.function(S_treatment) ||
+      !is.finite(interim_time) || !is.finite(final_time) ||
+      final_time <= interim_time ||
+      !is.finite(n1_total) || !is.finite(n2_total) ||
+      !is.finite(accrual_length) || accrual_length < 0 ||
+      !is.finite(n_add) || n_add < 0 ||
+      !is.finite(add_accrual_length) || add_accrual_length < 0 ||
+      !is.finite(add_accrual_start) || add_accrual_start < interim_time ||
+      !is.finite(fixed_followup) || fixed_followup <= 0) {
+    return(list(U2_gs = NA_real_, I2 = NA_real_, mu_z2 = NA_real_))
+  }
+
+  tt <- seq(interim_time, final_time, length.out = as.integer(n_grid) + 1L)
+
+  n_add <- as.integer(round(n_add))
+  n_add_1 <- n_add %/% 2L
+  n_add_2 <- n_add - n_add_1
+
+  prepare_arm <- function(g, S_fun, n_total_arm) {
+    idx_cens <- which(interim_data$group == g & interim_data$cens == 0)
+    rj <- interim_data$rec_time[idx_cens]
+    tobs <- pmax(interim_data$time[idx_cens], 0)
+
+    Sobs <- if (length(idx_cens) > 0L) {
+      tryCatch(as.numeric(S_fun(tobs)),
+               error = function(e) rep(NA_real_, length(tobs)))
+    } else numeric(0)
+
+    if (length(Sobs) != length(tobs) ||
+        any(!is.finite(Sobs)) || any(Sobs <= 0)) {
+      return(NULL)
+    }
+
+    n_enrolled <- sum(interim_data$group == g)
+    n_future <- max(as.integer(round(n_total_arm)) - n_enrolled, 0L)
+
+    list(
+      idx_cens = idx_cens,
+      rj = rj,
+      tobs = tobs,
+      Sobs = Sobs,
+      n_future = n_future
+    )
+  }
+
+  prep1 <- prepare_arm(1L, S_control, n1_total)
+  prep2 <- prepare_arm(2L, S_treatment, n2_total)
+  if (is.null(prep1) || is.null(prep2)) {
+    return(list(U2_gs = NA_real_, I2 = NA_real_, mu_z2 = NA_real_))
+  }
+
+  make_cohort_design <- function(accrual_start, accrual_end) {
+    if (!is.finite(accrual_start) || !is.finite(accrual_end) ||
+        accrual_end < accrual_start) return(NULL)
+
+    if (accrual_end == accrual_start) {
+      uu <- accrual_start
+    } else {
+      m <- max(10L, as.integer(n_accrual_grid))
+      br <- seq(accrual_start, accrual_end, length.out = m + 1L)
+      uu <- (head(br, -1) + tail(br, -1)) / 2
+    }
+
+    age <- outer(tt, uu, "-")
+    list(
+      enrolled = age >= 0,
+      at_risk = age >= 0 & age <= fixed_followup,
+      age0 = pmin(pmax(age, 0), fixed_followup),
+      n_u = length(uu)
+    )
+  }
+
+  original_design <- if (prep1$n_future > 0L || prep2$n_future > 0L) {
+    if (accrual_length <= interim_time) NULL
+    else make_cohort_design(interim_time, accrual_length)
+  } else {
+    list(enrolled = NULL, age0 = NULL, n_u = 0L)
+  }
+
+  added_design <- if (n_add_1 > 0L || n_add_2 > 0L) {
+    make_cohort_design(add_accrual_start, add_accrual_start + add_accrual_length)
+  } else {
+    list(enrolled = NULL, age0 = NULL, n_u = 0L)
+  }
+
+  if ((prep1$n_future > 0L || prep2$n_future > 0L) && is.null(original_design)) {
+    return(list(U2_gs = NA_real_, I2 = NA_real_, mu_z2 = NA_real_))
+  }
+  if ((n_add_1 > 0L || n_add_2 > 0L) && is.null(added_design)) {
+    return(list(U2_gs = NA_real_, I2 = NA_real_, mu_z2 = NA_real_))
+  }
+
+  add_future_cohort <- function(n_cohort, design, S_fun) {
+    if (n_cohort <= 0L) {
+      return(list(Y = numeric(length(tt)), C = numeric(length(tt))))
+    }
+    if (is.null(design) || design$n_u <= 0L) return(NULL)
+
+    Sv <- tryCatch(
+      matrix(
+        as.numeric(S_fun(as.vector(design$age0))),
+        nrow = length(tt),
+        ncol = design$n_u
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(Sv) || any(!is.finite(Sv))) return(NULL)
+    Sv <- pmin(pmax(Sv, 0), 1)
+
+    Yc <- n_cohort * rowMeans(Sv * design$at_risk)
+    Cc <- n_cohort * rowMeans((1 - Sv) * design$enrolled)
+    list(Y = Yc, C = Cc)
+  }
+
+  arm_path <- function(prep, S_fun, n_add_arm) {
+    Y <- numeric(length(tt))
+    C <- numeric(length(tt))
+
+    if (length(prep$idx_cens) > 0L) {
+      raw_age <- outer(tt, prep$rj, "-")
+      age <- pmax(
+        raw_age,
+        matrix(
+          prep$tobs,
+          nrow = length(tt),
+          ncol = length(prep$tobs),
+          byrow = TRUE
+        )
+      )
+      age <- pmin(age, fixed_followup)
+
+      Send <- tryCatch(
+        matrix(
+          as.numeric(S_fun(as.vector(age))),
+          nrow = length(tt),
+          ncol = length(prep$rj)
+        ),
+        error = function(e) NULL
+      )
+      if (is.null(Send) || any(!is.finite(Send))) return(NULL)
+
+      Q <- sweep(Send, 2L, prep$Sobs, "/")
+      Q <- pmin(pmax(Q, 0), 1)
+
+      at_risk <- raw_age <= fixed_followup
+      Y <- Y + rowSums(Q * at_risk)
+      C <- C + rowSums(1 - Q)
+    }
+
+    if (prep$n_future > 0L) {
+      z <- add_future_cohort(prep$n_future, original_design, S_fun)
+      if (is.null(z)) return(NULL)
+      Y <- Y + z$Y
+      C <- C + z$C
+    }
+
+    if (n_add_arm > 0L) {
+      z <- add_future_cohort(n_add_arm, added_design, S_fun)
+      if (is.null(z)) return(NULL)
+      Y <- Y + z$Y
+      C <- C + z$C
+    }
+
+    list(Y = Y, C = C)
+  }
+
+  a1 <- arm_path(prep1, S_control, n_add_1)
+  a2 <- arm_path(prep2, S_treatment, n_add_2)
+  if (is.null(a1) || is.null(a2)) {
+    return(list(U2_gs = NA_real_, I2 = NA_real_, mu_z2 = NA_real_))
+  }
+
+  dN1 <- pmax(diff(a1$C), 0)
+  dN2 <- pmax(diff(a2$C), 0)
+  dN <- dN1 + dN2
+  Y1 <- head(a1$Y, -1)
+  Y2 <- head(a2$Y, -1)
+  Ytot <- Y1 + Y2
+
+  ok <- is.finite(Ytot) & Ytot > 1e-10 & is.finite(dN) & dN >= 0
+  if (!any(ok)) {
+    return(list(U2_gs = NA_real_, I2 = NA_real_, mu_z2 = NA_real_))
+  }
+
+  U2_trt <- sum(
+    dN2[ok] - (Y2[ok] / Ytot[ok]) * dN[ok]
+  )
+  I2 <- sum(
+    (Y1[ok] * Y2[ok] / (Ytot[ok]^2)) * dN[ok]
+  )
+  U2_gs <- -U2_trt
+  mu_z2 <- if (is.finite(I2) && I2 > 0) U2_gs / sqrt(I2) else NA_real_
+
+  if (isTRUE(return_path)) {
+    Uinc_gs <- -(dN2 - (Y2 / pmax(Ytot, 1e-12)) * dN)
+    Iinc <- (Y1 * Y2 / pmax(Ytot^2, 1e-12)) * dN
+    Uinc_gs[!ok] <- 0
+    Iinc[!ok] <- 0
+    return(list(
+      U2_gs = U2_gs, I2 = I2, mu_z2 = mu_z2,
+      time = tt[-1],
+      future_events = cumsum(dN),
+      cum_U2_gs = cumsum(Uinc_gs),
+      cum_I2 = cumsum(Iinc)
+    ))
+  }
+
+  list(U2_gs = U2_gs, I2 = I2, mu_z2 = mu_z2)
+}
+
+build_chw_logrank_path <- function(
+    D_max, z1_gs, x_gs,
+    interim_data, interim_time,
+    S_control, S_treatment,
+    n1_total, n2_total, accrual_length,
+    n_add = 0L, add_accrual_length = 0) {
+
+  L_max <- predict_final_event_time(
+    interim_data = interim_data, interim_time = interim_time,
+    S_control = S_control, S_treatment = S_treatment,
+    target_events = D_max,
+    n1_total = n1_total, n2_total = n2_total,
+    accrual_length = accrual_length,
+    n_add = n_add, add_accrual_start = max(accrual_length, interim_time),
+    add_accrual_end = max(accrual_length, interim_time) + add_accrual_length
+  )
+  if (!is.finite(L_max) || L_max <= interim_time) return(NULL)
+
+  zcrit2 <- tryCatch(as.numeric(z2NC(z1 = z1_gs, x = x_gs)), error = function(e) NA_real_)
+  if (!is.finite(zcrit2)) return(NULL)
+
+  path <- expected_stage2_logrank_at_time(
+    interim_data = interim_data, interim_time = interim_time, final_time = L_max,
+    S_control = S_control, S_treatment = S_treatment,
+    n1_total = n1_total, n2_total = n2_total,
+    accrual_length = accrual_length,
+    n_add = n_add, add_accrual_length = add_accrual_length,
+    return_path = TRUE
+  )
+  if (is.null(path$future_events) || any(!is.finite(path$future_events))) return(NULL)
+
+  path$interim_events <- sum(interim_data$cens)
+  path$zcrit2 <- zcrit2
+  path$L_max <- L_max
+
+  Dpath <- path$interim_events + path$future_events
+  keep <- is.finite(Dpath) & is.finite(path$cum_U2_gs) & is.finite(path$cum_I2)
+  Dpath <- Dpath[keep]
+  Upath <- path$cum_U2_gs[keep]
+  Ipath <- path$cum_I2[keep]
+  Tpath <- path$time[keep]
+  nd <- !duplicated(Dpath)
+  path$Dpath_eval <- Dpath[nd]
+  path$Upath_eval <- Upath[nd]
+  path$Ipath_eval <- Ipath[nd]
+  path$Tpath_eval <- Tpath[nd]
+  path
+}
+
+cp_from_chw_logrank_path <- function(path, target_events) {
+  if (is.null(path) || !is.finite(target_events)) {
+    return(list(cp = NA_real_, mu_z2 = NA_real_, U2_gs = NA_real_, I2 = NA_real_, L_pred = NA_real_))
+  }
+
+  if (!is.null(path$Dpath_eval)) {
+    Dpath <- path$Dpath_eval
+    Upath <- path$Upath_eval
+    Ipath <- path$Ipath_eval
+    Tpath <- path$Tpath_eval
+  } else {
+    Dpath <- path$interim_events + path$future_events
+    keep <- is.finite(Dpath) & is.finite(path$cum_U2_gs) & is.finite(path$cum_I2)
+    Dpath <- Dpath[keep]
+    Upath <- path$cum_U2_gs[keep]
+    Ipath <- path$cum_I2[keep]
+    Tpath <- path$time[keep]
+    nd <- !duplicated(Dpath)
+    Dpath <- Dpath[nd]; Upath <- Upath[nd]; Ipath <- Ipath[nd]; Tpath <- Tpath[nd]
+  }
+  if (length(Dpath) < 2L || max(Dpath) + 1e-8 < target_events) {
+    return(list(cp = NA_real_, mu_z2 = NA_real_, U2_gs = NA_real_, I2 = NA_real_, L_pred = NA_real_))
+  }
+
+  U <- approx(Dpath, Upath, xout = target_events, rule = 2, ties = "ordered")$y
+  I <- approx(Dpath, Ipath, xout = target_events, rule = 2, ties = "ordered")$y
+  L <- approx(Dpath, Tpath, xout = target_events, rule = 2, ties = "ordered")$y
+  mu <- if (is.finite(I) && I > 0) U / sqrt(I) else NA_real_
+  cp <- if (is.finite(mu)) pnorm(mu - path$zcrit2) else NA_real_
+  list(cp = cp, mu_z2 = mu, U2_gs = U, I2 = I, L_pred = L)
+}
+
+
+cp_many_from_chw_logrank_path <- function(path, target_events) {
+  target_events <- as.numeric(target_events)
+  nout <- length(target_events)
+  if (is.null(path) || nout == 0L || any(!is.finite(target_events))) {
+    return(data.frame(
+      target_events = target_events,
+      cp = rep(NA_real_, nout),
+      mu_z2 = rep(NA_real_, nout),
+      U2_gs = rep(NA_real_, nout),
+      I2 = rep(NA_real_, nout),
+      L_pred = rep(NA_real_, nout)
+    ))
+  }
+
+  if (!is.null(path$Dpath_eval)) {
+    Dpath <- path$Dpath_eval
+    Upath <- path$Upath_eval
+    Ipath <- path$Ipath_eval
+    Tpath <- path$Tpath_eval
+  } else {
+    Dpath <- path$interim_events + path$future_events
+    keep <- is.finite(Dpath) & is.finite(path$cum_U2_gs) & is.finite(path$cum_I2)
+    Dpath <- Dpath[keep]
+    Upath <- path$cum_U2_gs[keep]
+    Ipath <- path$cum_I2[keep]
+    Tpath <- path$time[keep]
+    nd <- !duplicated(Dpath)
+    Dpath <- Dpath[nd]; Upath <- Upath[nd]; Ipath <- Ipath[nd]; Tpath <- Tpath[nd]
+  }
+
+  if (length(Dpath) < 2L) {
+    return(data.frame(
+      target_events = target_events,
+      cp = rep(NA_real_, nout),
+      mu_z2 = rep(NA_real_, nout),
+      U2_gs = rep(NA_real_, nout),
+      I2 = rep(NA_real_, nout),
+      L_pred = rep(NA_real_, nout)
+    ))
+  }
+
+  evaluable <- target_events <= max(Dpath) + 1e-8
+  U <- I <- L <- rep(NA_real_, nout)
+  if (any(evaluable)) {
+    U[evaluable] <- approx(Dpath, Upath, xout = target_events[evaluable], rule = 2, ties = "ordered")$y
+    I[evaluable] <- approx(Dpath, Ipath, xout = target_events[evaluable], rule = 2, ties = "ordered")$y
+    L[evaluable] <- approx(Dpath, Tpath, xout = target_events[evaluable], rule = 2, ties = "ordered")$y
+  }
+  mu <- ifelse(is.finite(I) & I > 0, U / sqrt(I), NA_real_)
+  cp <- ifelse(is.finite(mu), pnorm(mu - path$zcrit2), NA_real_)
+
+  data.frame(
+    target_events = target_events,
+    cp = cp,
+    mu_z2 = mu,
+    U2_gs = U,
+    I2 = I,
+    L_pred = L
+  )
+}
+
+predict_chw_cp_for_event_target <- function(
+    target_events, z1_gs, x_gs,
+    interim_data, interim_time,
+    S_control, S_treatment,
+    n1_total, n2_total, accrual_length,
+    n_add = 0L, add_accrual_length = 0,
+    L_pred_override = NULL) {
+
+  L_pred <- if (!is.null(L_pred_override) && length(L_pred_override) == 1L &&
+                is.finite(L_pred_override)) {
+    as.numeric(L_pred_override)
+  } else predict_final_event_time(
+    interim_data = interim_data,
+    interim_time = interim_time,
+    S_control = S_control,
+    S_treatment = S_treatment,
+    target_events = target_events,
+    n1_total = n1_total,
+    n2_total = n2_total,
+    accrual_length = accrual_length,
+    n_add = n_add,
+    add_accrual_start = max(accrual_length, interim_time),
+    add_accrual_end = max(accrual_length, interim_time) + add_accrual_length
+  )
+
+  if (!is.finite(L_pred) || L_pred <= interim_time) {
+    return(list(cp = NA_real_, L_pred = L_pred, mu_z2 = NA_real_, U2_gs = NA_real_, I2 = NA_real_))
+  }
+
+  pred <- expected_stage2_logrank_at_time(
+    interim_data = interim_data,
+    interim_time = interim_time,
+    final_time = L_pred,
+    S_control = S_control,
+    S_treatment = S_treatment,
+    n1_total = n1_total,
+    n2_total = n2_total,
+    accrual_length = accrual_length,
+    n_add = n_add,
+    add_accrual_length = add_accrual_length
+  )
+
+  zcrit2 <- tryCatch(as.numeric(z2NC(z1 = z1_gs, x = x_gs)), error = function(e) NA_real_)
+  cp <- if (is.finite(pred$mu_z2) && is.finite(zcrit2)) {
+    pnorm(pred$mu_z2 - zcrit2)
+  } else {
+    NA_real_
+  }
+
+  list(
+    cp = cp,
+    L_pred = L_pred,
+    mu_z2 = pred$mu_z2,
+    U2_gs = pred$U2_gs,
+    I2 = pred$I2
+  )
+}
+
+find_D_for_target_cp_logrank <- function(
+    target_cp, D_min, D_max, z1_gs, x_gs,
+    interim_data, interim_time,
+    S_control, S_treatment,
+    n1_total, n2_total, accrual_length) {
+
+  path <- build_chw_logrank_path(
+    D_max = D_max,
+    z1_gs = z1_gs, x_gs = x_gs,
+    interim_data = interim_data, interim_time = interim_time,
+    S_control = S_control, S_treatment = S_treatment,
+    n1_total = n1_total, n2_total = n2_total,
+    accrual_length = accrual_length
+  )
+  if (is.null(path)) return(list(D = NA_real_, pred = NULL, path = NULL))
+
+  pred_min <- cp_from_chw_logrank_path(path, D_min)
+  if (!is.finite(pred_min$cp)) return(list(D = NA_real_, pred = pred_min, path = path))
+  if (pred_min$cp >= target_cp) return(list(D = D_min, pred = pred_min, path = path))
+
+  lo <- max(ceiling(D_min + 1e-8), ceiling(D_min))
+  hi <- floor(D_max)
+  if (lo > hi) return(list(D = D_max, pred = pred_min, path = path))
+
+  pred_last <- pred_min
+  for (Dc in seq.int(lo, hi)) {
+    pc <- cp_from_chw_logrank_path(path, Dc)
+    if (!is.finite(pc$cp)) return(list(D = NA_real_, pred = pc, path = path))
+    pred_last <- pc
+    if (pc$cp >= target_cp) return(list(D = Dc, pred = pc, path = path))
+  }
+
+  list(D = hi, pred = pred_last, path = path)
+}
+
+predict_true_event_time_uniform <- function(
+    S_control, S_treatment, n_total, accrual_length, target_events) {
+
+  if (!is.function(S_control) || !is.function(S_treatment) ||
+      !is.finite(n_total) || n_total <= 0 ||
+      !is.finite(accrual_length) || accrual_length < 0 ||
+      !is.finite(target_events) || target_events <= 0 ||
+      target_events >= n_total) {
+    return(NA_real_)
+  }
+
+  expected_events <- function(L) {
+    p_control <- average_event_probability_true(
+      S_control, L, accrual_length
+    )
+    p_treatment <- average_event_probability_true(
+      S_treatment, L, accrual_length
+    )
+
+    if (!all(is.finite(c(p_control, p_treatment)))) return(NA_real_)
+
+    (n_total / 2) * (p_control + p_treatment)
+  }
+
+  lower <- 0
+  upper <- max(accrual_length + 1, 1)
+  f_upper <- expected_events(upper) - target_events
+  n_expand <- 0L
+
+  while ((!is.finite(f_upper) || f_upper < 0) && n_expand < 60L) {
+    upper <- max(2 * upper, upper + 1)
+    f_upper <- expected_events(upper) - target_events
+    n_expand <- n_expand + 1L
+  }
+
+  if (!is.finite(f_upper) || f_upper < 0) return(NA_real_)
+
+  tryCatch(
+    uniroot(
+      function(L) expected_events(L) - target_events,
+      lower = lower,
+      upper = upper,
+      tol = 1e-8
+    )$root,
+    error = function(e) NA_real_
+  )
+}
+
+
+# Run simulations
+simu <- function(type, alpha, beta,
+                 rate1, rate2,
+                 c_shape_pre, c_shape_post,
+                 c_scale_pre, c_scale_post,
+                 t_shape_pre, t_shape_post,
+                 t_scale_pre, t_scale_post,
+                 change1, change2,
+                 rec, CL, CU,
+                 num_simulations,
+                 extrap_dist,
+                 event_generator_control = NULL,
+                 event_generator_treatment = NULL,
+                 S_control_override = NULL,
+                 S_treatment_override = NULL) {
+
+  if (length(rec) > 1L) {
+    rec_values <- rec
+    current_call <- match.call()
+    caller_env <- parent.frame()
+    rec_results <- lapply(rec_values, function(rec_i) {
+      current_call$rec <- rec_i
+      eval(current_call, envir = caller_env)
+    })
+    rec_results <- rec_results[!vapply(rec_results, is.null, logical(1))]
+    if (length(rec_results) == 0L) return(NULL)
+    return(do.call(rbind, rec_results))
+  }
+
+  alpha_one_sided <- 0.025
+  z_alpha <- qnorm(1 - alpha_one_sided)
+  z_beta  <- qnorm(1 - beta)         
+  z_total <- z_alpha + z_beta
+
+  lambda1 <- -log(1 - rate1)
+  lambda2 <- -log(1 - rate2)
+  HR      <- lambda2 / lambda1
+  if (!is.finite(HR) || HR <= 0) HR <- 0.99
+  logHR   <- log(HR)
+
+  FIXED_FOLLOWUP <- 5
+
+  d_required <- 4 * (z_total / logHR)^2
+
+  design_event_prob1 <- 1 - exp(-lambda1 * FIXED_FOLLOWUP)
+  design_event_prob2 <- 1 - exp(-lambda2 * FIXED_FOLLOWUP)
+  design_pooled_event_prob <- (design_event_prob1 + design_event_prob2) / 2
+
+  n <- ceiling(d_required / design_pooled_event_prob / 2) * 2
+  n1 <- n / 2
+  n2 <- n / 2
+  d <- ceiling(n * design_pooled_event_prob)
+  d_half <- ceiling(d / 2)
+
+  x_gs <- make_gs_design(
+    d_half = d_half, d = d,
+    alpha_one_sided = alpha_one_sided, beta = beta
+  )
+  theta_design_gs <- x_gs$theta[2]
+  w1_chw <- sqrt(x_gs$n.I[1] / x_gs$n.I[2])
+  w2_chw <- sqrt(1 - x_gs$n.I[1] / x_gs$n.I[2])
+
+  rec_length <- rec
+
+  final_results <- vector("list", as.integer(num_simulations))
+  count_simu <- 0L
+
+  fail_interim_event_target <- 0L
+  fail_interim_arm_information <- 0L
+  fail_extrapolation_model <- 0L
+  fail_extrapolation_prediction <- 0L
+  fail_interim_logrank <- 0L
+  fail_conditional_power <- 0L
+  fail_ssr_target <- 0L
+  fail_final_event_target <- 0L
+  fail_final_logrank <- 0L
+  fail_original_final_logrank <- 0L
+  fail_saved_replicate_nonfinite <- 0L
+
+  for (i in 1:num_simulations) {
+
+    if (is.function(event_generator_control)) {
+      event_time1 <- event_generator_control(n1)
+    } else {
+      event_time1 <- rweibull_piecewise(
+        n          = n1,
+        shape_pre  = c_shape_pre,
+        scale_pre  = c_scale_pre,
+        shape_post = c_shape_post,
+        scale_post = c_scale_post,
+        c          = change1
+      )
+    }
+
+    if (is.function(event_generator_treatment)) {
+      event_time2 <- event_generator_treatment(n2)
+    } else {
+      event_time2 <- rweibull_piecewise(
+        n          = n2,
+        shape_pre  = t_shape_pre,
+        scale_pre  = t_scale_pre,
+        shape_post = t_shape_post,
+        scale_post = t_scale_post,
+        c          = change2
+      )
+    }
+
+    event_time <- c(event_time1, event_time2)
+    group      <- c(rep(1, n1), rep(2, n2))
+    subj       <- 1:n
+
+    rec_time   <- runif(n, 0, rec_length)
+    study_time <- rec_time + event_time
+
+    all_data <- data.frame(
+      study_time = study_time,
+      event_time = event_time,
+      rec_time   = rec_time,
+      group      = group,
+      subj       = subj
+    )
+
+    k_plan <- ceiling(d)
+
+    eligible_event_times <- all_data$study_time[all_data$event_time <= FIXED_FOLLOWUP]
+    ord_times <- sort(eligible_event_times)
+    if (length(ord_times) < d_half) {
+      fail_interim_event_target <- fail_interim_event_target + 1L
+      next
+    }
+    interim_time <- ord_times[d_half]
+
+    i_data <- all_data[all_data$rec_time < interim_time, , drop = FALSE]
+    interim_available_fu <- pmin(
+      pmax(interim_time - i_data$rec_time, 0),
+      FIXED_FOLLOWUP
+    )
+    i_data$cens <- as.integer(i_data$event_time <= interim_available_fu)
+    i_data$time <- pmin(i_data$event_time, interim_available_fu)
+    i_data$time[i_data$time < 0] <- 0
+
+    i_data_1 <- i_data[i_data$group == 1,]
+    i_data_2 <- i_data[i_data$group == 2,]
+
+    if (nrow(i_data_1) == 0 || nrow(i_data_2) == 0 ||
+        sum(i_data_1$cens) < 1 || sum(i_data_2$cens) < 1) {
+      fail_interim_arm_information <- fail_interim_arm_information + 1L
+      next
+    }
+
+    i1 <- sum(i_data$cens)
+
+a1 <- survfit(Surv(i_data_1$time, i_data_1$cens) ~ 1)
+a2 <- survfit(Surv(i_data_2$time, i_data_2$cens) ~ 1)
+
+lam1_assume <- -log(1 - rate1) / 5
+lam2_assume <- -log(1 - rate2) / 5
+
+S1_hat <- make_theta_extrapolation(
+  sf_obj = a1,
+  arm_time = i_data_1$time,
+  arm_cens = i_data_1$cens,
+  lam_assume = lam1_assume,
+  extrap_method = extrap_dist
+)
+S2_hat <- make_theta_extrapolation(
+  sf_obj = a2,
+  arm_time = i_data_2$time,
+  arm_cens = i_data_2$cens,
+  lam_assume = lam2_assume,
+  extrap_method = extrap_dist
+)
+
+if (is.null(S1_hat) || !is.function(S1_hat) ||
+    is.null(S2_hat) || !is.function(S2_hat)) {
+  fail_extrapolation_model <- fail_extrapolation_model + 1L
+  next
+}
+
+t_last_1 <- if (any(i_data_1$cens == 1)) max(i_data_1$time[i_data_1$cens == 1]) else max(i_data_1$time)
+t_last_2 <- if (any(i_data_2$cens == 1)) max(i_data_2$time[i_data_2$cens == 1]) else max(i_data_2$time)
+
+t_end_max1 <- FIXED_FOLLOWUP
+t_end_max2 <- FIXED_FOLLOWUP
+
+tmax_1 <- max(2 * FIXED_FOLLOWUP, 3 * t_last_1)
+tmax_2 <- max(2 * FIXED_FOLLOWUP, 3 * t_last_2)
+
+mst_hat_1 <- mst_from_S(S1_hat, t_max = tmax_1)
+mst_hat_2 <- mst_from_S(S2_hat, t_max = tmax_2)
+
+mst_hat_overall <- mean(c(mst_hat_1, mst_hat_2), na.rm = TRUE)
+
+
+if (is.function(S_control_override)) {
+  S1_true <- S_control_override
+} else {
+  S1_true <- function(t) S_pieceweib(t, c_shape_pre, c_scale_pre, c_shape_post, c_scale_post, change1)
+}
+if (is.function(S_treatment_override)) {
+  S2_true <- S_treatment_override
+} else {
+  S2_true <- function(t) S_pieceweib(t, t_shape_pre, t_scale_pre, t_shape_post, t_scale_post, change2)
+}
+
+mst_true_1 <- mst_from_S(S1_true, t_max = tmax_1)
+mst_true_2 <- mst_from_S(S2_true, t_max = tmax_2)
+
+mst_true_overall <- mean(c(mst_true_1, mst_true_2), na.rm = TRUE)
+
+
+if (!valid_survival_function(S1_hat, tmax_1) ||
+    !valid_survival_function(S2_hat, tmax_2) ||
+    !is.finite(mst_hat_1) || !is.finite(mst_hat_2) ||
+    mst_hat_1 <= 0 || mst_hat_2 <= 0) {
+  fail_extrapolation_prediction <- fail_extrapolation_prediction + 1L
+  next
+}
+
+
+p1_raw <- 1 - as.numeric(S1_hat(FIXED_FOLLOWUP))[1]
+p2_raw <- 1 - as.numeric(S2_hat(FIXED_FOLLOWUP))[1]
+
+
+    if (!is.finite(p1_raw) || !is.finite(p2_raw) ||
+        is.na(p1_raw)      || is.na(p2_raw)      ||
+        p1_raw <= 0        || p2_raw <= 0        ||
+        p1_raw >= 1        || p2_raw >= 1) {
+
+      fail_extrapolation_prediction <- fail_extrapolation_prediction + 1L
+      next
+    }
+
+    p1w <- p1_raw
+    p2w <- p2_raw
+
+i1 <- sum(i_data$cens)
+tmp1 <- tryCatch(
+  survdiff(Surv(time, cens) ~ factor(group), data = i_data),
+  error = function(e) NULL
+)
+
+if (is.null(tmp1)) {
+  fail_interim_logrank <- fail_interim_logrank + 1L
+  next
+}
+OE1 <- tmp1$obs - tmp1$exp
+U1  <- as.numeric(OE1[2])
+I1  <- as.numeric(tmp1$var[1,1])
+if (!is.finite(U1) || !is.finite(I1) || I1 <= 0) {
+  fail_interim_logrank <- fail_interim_logrank + 1L
+  next
+}
+Z1 <- U1 / sqrt(I1)
+if (!is.finite(Z1)) {
+  fail_interim_logrank <- fail_interim_logrank + 1L
+  next
+}
+
+    nlhr_star <- -log(-log(1 - p2w)) + log(-log(1 - p1w))
+    if (!is.finite(nlhr_star)) {
+      fail_extrapolation_prediction <- fail_extrapolation_prediction + 1L
+      next
+    }
+
+    Z1_gs <- -Z1
+    interim_treatment_favored <- is.finite(Z1_gs) && (Z1_gs > 0)
+
+    theta_future_calendar_end <- rec_length + FIXED_FOLLOWUP
+    future_lr_prediction <- expected_stage2_logrank_at_time(
+      interim_data = i_data,
+      interim_time = interim_time,
+      final_time = theta_future_calendar_end,
+      S_control = S1_hat,
+      S_treatment = S2_hat,
+      n1_total = n1,
+      n2_total = n2,
+      accrual_length = rec_length,
+      n_add = 0L,
+      add_accrual_length = 0,
+      return_path = TRUE
+    )
+
+    predicted_future_events <- if (!is.null(future_lr_prediction$future_events) &&
+                                   length(future_lr_prediction$future_events) > 0L) {
+      tail(future_lr_prediction$future_events, 1L)
+    } else {
+      NA_real_
+    }
+
+    theta_future_lr <- if (is.finite(future_lr_prediction$mu_z2) &&
+                           is.finite(predicted_future_events) &&
+                           predicted_future_events > 0) {
+      future_lr_prediction$mu_z2 / sqrt(predicted_future_events)
+    } else {
+      NA_real_
+    }
+
+    if (!is.finite(theta_future_lr)) {
+      fail_extrapolation_prediction <- fail_extrapolation_prediction + 1L
+      next
+    }
+
+    pred_cp_d <- analytic_chw_cp_vector(
+      target_events = d,
+      interim_events = i1,
+      z1_gs = Z1_gs,
+      x_gs = x_gs,
+      theta_logrank = theta_future_lr
+    )
+    CP_no_inc <- pred_cp_d$cp[1]
+
+    CP_design_assumption <- gs_cond_power(
+      z1_gs = Z1_gs, D_total = d, x_gs = x_gs, theta = theta_design_gs
+    )
+
+    if (!is.finite(CP_no_inc) || CP_no_inc < 0 || CP_no_inc > 1 ||
+        !is.finite(CP_design_assumption) ||
+        !is.finite(pred_cp_d$mu_z2[1])) {
+      fail_conditional_power <- fail_conditional_power + 1L
+      next
+    }
+
+    in_resize_zone <- is.finite(CP_no_inc) &&
+                      (CP_no_inc >= CL) &&
+                      (CP_no_inc < CU)
+
+    target_cp_ssr <- 0.9
+    predicted_future_benefit <- theta_future_lr > 1e-8
+    interim_treatment_favored <- is.finite(Z1_gs) && (Z1_gs > 0)
+
+    if (in_resize_zone && interim_treatment_favored && predicted_future_benefit) {
+      if (CP_no_inc >= target_cp_ssr) {
+        d_star_extrap_raw <- d
+      } else {
+        d_star_extrap_raw <- floor(2 * d)
+        Dc_seq <- seq.int(ceiling(d + 1e-8), floor(2 * d))
+        cp_seq <- analytic_chw_cp_vector(
+          target_events = Dc_seq,
+          interim_events = i1,
+          z1_gs = Z1_gs,
+          x_gs = x_gs,
+          theta_logrank = theta_future_lr
+        )
+        if (any(!is.finite(cp_seq$cp))) {
+          fail_ssr_target <- fail_ssr_target + 1L
+          d_star_extrap_raw <- NA_real_
+        } else {
+          hit <- which(cp_seq$cp >= target_cp_ssr)
+          if (length(hit) > 0L) d_star_extrap_raw <- Dc_seq[hit[1L]]
+        }
+      }
+    } else {
+      d_star_extrap_raw <- d
+    }
+
+    if (!is.finite(d_star_extrap_raw)) next
+    d_star_cap <- if (d_star_extrap_raw <= d + 1e-8) {
+      d
+    } else {
+      min(ceiling(d_star_extrap_raw), floor(2 * d))
+    }
+    if (!is.finite(d_star_cap) || d_star_cap < d ||
+        d_star_cap > 2 * d + 1e-8) {
+      fail_ssr_target <- fail_ssr_target + 1L
+      next
+    }
+
+    allow_ssr <- (type == "Unblinded") &&
+                 interim_treatment_favored &&
+                 predicted_future_benefit &&
+                 in_resize_zone
+
+    d_star <- if (allow_ssr && d_star_cap > d) max(d, d_star_cap) else d
+
+    pooled_event_prob <- (p1w + p2w) / 2
+    n_star_raw <- if (allow_ssr) d_star / pooled_event_prob else n
+    n_new_target <- max(n, ceiling(n_star_raw / 2) * 2)
+
+    if (!is.finite(n_new_target) || n_new_target < n) {
+      fail_ssr_target <- fail_ssr_target + 1L
+      next
+    }
+
+    if (allow_ssr && n_new_target > n) {
+      n_add_pred <- n_new_target - n
+      add_rec_length_pred <- rec_length * (n_add_pred / n)
+      add_accrual_start_pred <- max(rec_length, interim_time)
+      adapted_final_time_pred <- add_accrual_start_pred +
+                                 add_rec_length_pred +
+                                 FIXED_FOLLOWUP
+
+      future_lr_prediction_refined <- expected_stage2_logrank_at_time(
+        interim_data = i_data,
+        interim_time = interim_time,
+        final_time = adapted_final_time_pred,
+        S_control = S1_hat,
+        S_treatment = S2_hat,
+        n1_total = n1,
+        n2_total = n2,
+        accrual_length = rec_length,
+        n_add = n_add_pred,
+        add_accrual_length = add_rec_length_pred,
+        add_accrual_start = add_accrual_start_pred,
+        return_path = TRUE
+      )
+
+      predicted_future_events_refined <-
+        if (!is.null(future_lr_prediction_refined$future_events) &&
+            length(future_lr_prediction_refined$future_events) > 0L) {
+          tail(future_lr_prediction_refined$future_events, 1L)
+        } else {
+          NA_real_
+        }
+
+      theta_future_lr_refined <-
+        if (is.finite(future_lr_prediction_refined$mu_z2) &&
+            is.finite(predicted_future_events_refined) &&
+            predicted_future_events_refined > 0) {
+          future_lr_prediction_refined$mu_z2 /
+            sqrt(predicted_future_events_refined)
+        } else {
+          NA_real_
+        }
+
+      if (!is.finite(theta_future_lr_refined)) {
+        fail_extrapolation_prediction <- fail_extrapolation_prediction + 1L
+        next
+      }
+
+      pred_cp_d_refined <- analytic_chw_cp_vector(
+        target_events = d,
+        interim_events = i1,
+        z1_gs = Z1_gs,
+        x_gs = x_gs,
+        theta_logrank = theta_future_lr_refined
+      )
+
+      if (!is.finite(pred_cp_d_refined$cp[1])) {
+        fail_conditional_power <- fail_conditional_power + 1L
+        next
+      }
+
+      if (pred_cp_d_refined$cp[1] >= target_cp_ssr) {
+        d_star_refined_raw <- d
+      } else {
+        d_star_refined_raw <- floor(2 * d)
+        Dc_seq_refined <- seq.int(ceiling(d + 1e-8), floor(2 * d))
+        cp_seq_refined <- analytic_chw_cp_vector(
+          target_events = Dc_seq_refined,
+          interim_events = i1,
+          z1_gs = Z1_gs,
+          x_gs = x_gs,
+          theta_logrank = theta_future_lr_refined
+        )
+
+        if (any(!is.finite(cp_seq_refined$cp))) {
+          fail_ssr_target <- fail_ssr_target + 1L
+          next
+        }
+
+        hit_refined <- which(cp_seq_refined$cp >= target_cp_ssr)
+        if (length(hit_refined) > 0L) {
+          d_star_refined_raw <- Dc_seq_refined[hit_refined[1L]]
+        }
+      }
+
+      d_star_refined_cap <- if (d_star_refined_raw <= d + 1e-8) {
+        d
+      } else {
+        min(ceiling(d_star_refined_raw), floor(2 * d))
+      }
+
+      if (!is.finite(d_star_refined_cap) ||
+          d_star_refined_cap < d ||
+          d_star_refined_cap > 2 * d + 1e-8) {
+        fail_ssr_target <- fail_ssr_target + 1L
+        next
+      }
+
+      d_star <- max(d, d_star_refined_cap)
+      n_star_raw <- d_star / pooled_event_prob
+      n_new_target <- max(n, ceiling(n_star_raw / 2) * 2)
+
+      if (!is.finite(n_new_target) || n_new_target < n) {
+        fail_ssr_target <- fail_ssr_target + 1L
+        next
+      }
+
+      theta_future_lr <- theta_future_lr_refined
+    }
+
+    rmst_hat_1 <- rmst_from_S(S1_hat, tau = 5)
+    rmst_hat_2 <- rmst_from_S(S2_hat, tau = 5)
+    rmst_true_1 <- rmst_from_S(S1_true, tau = 5)
+    rmst_true_2 <- rmst_from_S(S2_true, tau = 5)
+
+    if (any(!is.finite(c(
+      rmst_hat_1, rmst_hat_2, rmst_true_1, rmst_true_2
+    )))) {
+      fail_extrapolation_prediction <- fail_extrapolation_prediction + 1L
+      next
+    }
+
+    incD    <- as.integer(d_star > d)
+    incN    <- as.integer(n_new_target > n)
+
+    D_ratio <- d_star / d
+    N_ratio <- n_new_target / n
+
+    pred_cp_after <- analytic_chw_cp_vector(
+      target_events = d_star,
+      interim_events = i1,
+      z1_gs = Z1_gs,
+      x_gs = x_gs,
+      theta_logrank = theta_future_lr
+    )
+    CP_after_SSR <- pred_cp_after$cp[1]
+
+    if (!is.finite(CP_after_SSR) || CP_after_SSR < 0 || CP_after_SSR > 1) {
+      fail_conditional_power <- fail_conditional_power + 1L
+      next
+    }
+
+    target_events <- ceiling(d_star)
+
+    if (n_new_target > n) {
+      n_add <- n_new_target - n
+
+      if (is.function(event_generator_control)) {
+        add_event_time1 <- event_generator_control(n_add/2)
+      } else {
+        add_event_time1 <- rweibull_piecewise(
+          n          = n_add/2,
+          shape_pre  = c_shape_pre,
+          scale_pre  = c_scale_pre,
+          shape_post = c_shape_post,
+          scale_post = c_scale_post,
+          c          = change1
+        )
+      }
+
+      if (is.function(event_generator_treatment)) {
+        add_event_time2 <- event_generator_treatment(n_add/2)
+      } else {
+        add_event_time2 <- rweibull_piecewise(
+          n          = n_add/2,
+          shape_pre  = t_shape_pre,
+          scale_pre  = t_scale_pre,
+          shape_post = t_shape_post,
+          scale_post = t_scale_post,
+          c          = change2
+        )
+      }
+
+      add_event_time   <- c(add_event_time1, add_event_time2)
+      add_group        <- c(rep(1, n_add/2), rep(2, n_add/2))
+
+      add_rec_length <- rec_length * (n_add / n)
+      add_accrual_start <- max(rec_length, interim_time)
+      add_accrual_end <- add_accrual_start + add_rec_length
+      add_rec_time <- runif(n_add, add_accrual_start, add_accrual_end)
+      add_study_time <- add_rec_time + add_event_time
+      add_subj       <- (n+1):n_new_target
+
+      add_data <- data.frame(
+        study_time = add_study_time,
+        event_time = add_event_time,
+        rec_time   = add_rec_time,
+        group      = add_group,
+        subj       = add_subj
+      )
+
+      final_pool <- rbind(all_data, add_data)
+      n_new      <- n_new_target
+    } else {
+      final_pool <- all_data
+      n_new      <- n
+    }
+
+    final_data <- apply_fixed_followup(final_pool, FIXED_FOLLOWUP)
+
+i2 <- sum(final_data$cens)
+tmpF <- tryCatch(
+  survdiff(Surv(time, cens) ~ factor(group), data = final_data),
+  error = function(e) NULL
+)
+
+if (is.null(tmpF)) {
+  fail_final_logrank <- fail_final_logrank + 1L
+  next
+}
+OEF <- tmpF$obs - tmpF$exp
+U   <- as.numeric(OEF[2])
+I   <- as.numeric(tmpF$var[1,1])
+if (!is.finite(U) || !is.finite(I) || I <= I1) {
+  fail_final_logrank <- fail_final_logrank + 1L
+  next
+}
+Z3 <- U / sqrt(I)
+
+stage2_lr <- stage2_logrank_fixed_followup(
+  final_pool = final_pool,
+  interim_time = interim_time,
+  fixed_followup = FIXED_FOLLOWUP
+)
+U2 <- stage2_lr$U2
+I2 <- stage2_lr$I2
+if (!is.finite(U2) || !is.finite(I2) || I2 <= 0) {
+  fail_final_logrank <- fail_final_logrank + 1L
+  next
+}
+Z2 <- U2 / sqrt(I2)
+Z2_gs <- -Z2
+
+chw_gs <- w1_chw * Z1_gs + w2_chw * Z2_gs
+chw <- -chw_gs
+
+z2_critical_chw <- as.numeric(z2NC(z1 = Z1_gs, x = x_gs))
+
+p_value <- pnorm(-chw_gs)
+hypo <- as.integer(Z2_gs >= z2_critical_chw)
+
+z2_critical_suff <- as.numeric(z2Z(
+  z1 = Z1_gs, x = x_gs, n2 = pmax(i2 - i1, 1)
+))
+z_full_gs <- -Z3
+p_value_full <- pnorm(-z_full_gs)
+hypo_full <- as.integer(z_full_gs >= qnorm(1 - alpha_one_sided))
+
+    logHR_hat <- tryCatch({
+      cf <- coxph(Surv(time, cens) ~ factor(group), data = final_data)
+      as.numeric(coef(cf))
+    }, error = function(e) NA_real_)
+
+    p_final_data <- apply_fixed_followup(all_data, FIXED_FOLLOWUP)
+
+    p_tst <- tryCatch(
+      survdiff(Surv(time, cens) ~ factor(group), data = p_final_data),
+      error = function(e) NULL
+    )
+
+    if (is.null(p_tst)) {
+      fail_original_final_logrank <- fail_original_final_logrank + 1L
+      next
+    }
+    p_OE <- p_tst$obs - p_tst$exp
+    p_U  <- as.numeric(p_OE[2])
+    p_I  <- as.numeric(p_tst$var[1,1])
+    if (!is.finite(p_U) || !is.finite(p_I) || p_I <= I1) {
+      fail_original_final_logrank <- fail_original_final_logrank + 1L
+      next
+    }
+    p_Z <- p_U / sqrt(p_I)
+
+    p_stage2_lr <- stage2_logrank_fixed_followup(
+      final_pool = all_data,
+      interim_time = interim_time,
+      fixed_followup = FIXED_FOLLOWUP
+    )
+    p_U2 <- p_stage2_lr$U2
+    p_I2 <- p_stage2_lr$I2
+    if (!is.finite(p_U2) || !is.finite(p_I2) || p_I2 <= 0) {
+      fail_original_final_logrank <- fail_original_final_logrank + 1L
+      next
+    }
+    p_Z2 <- p_U2 / sqrt(p_I2)
+    p_Z2_gs <- -p_Z2
+
+    original_chw_z <- w1_chw * Z1_gs + w2_chw * p_Z2_gs
+    original_z2_critical_chw <- as.numeric(z2NC(z1 = Z1_gs, x = x_gs))
+    original_p_value <- pnorm(-original_chw_z)
+    original_hypo <- as.integer(p_Z2_gs >= original_z2_critical_chw)
+
+    original_full_z_gs <- -p_Z
+    original_full_p_value <- pnorm(-original_full_z_gs)
+    original_full_hypo <- as.integer(
+      original_full_z_gs >= qnorm(1 - alpha_one_sided)
+    )
+
+    CP_original <- CP_no_inc
+
+    candidate_result <- data.frame(
+      n_new = n_new,
+      ss    = nrow(final_data),
+      p_ss  = nrow(p_final_data),
+
+      events_initial_planned = ceiling(d),
+      subjects_initial_planned = n,
+      events_observed_interim = i1,
+      subjects_enrolled_interim = nrow(i_data),
+      pct_planned_subjects_enrolled_interim = 100 * nrow(i_data) / n,
+      events_observed_final = i2,
+      subjects_enrolled_final = nrow(final_data),
+
+      hypo  = hypo,
+      p_hypo = original_hypo,
+      p_value = p_value,
+      p_p_value = original_p_value,
+      incD = incD,
+      incN = incN,
+      D_ratio = D_ratio,
+      N_ratio = N_ratio,
+      ssr_relevant = as.integer((type == "Unblinded") &&
+        interim_treatment_favored && in_resize_zone),
+
+      CP_interim = CP_no_inc,
+      CP_after_SSR = CP_after_SSR,
+      CP_original = CP_original,
+      CP_design_assumption = CP_design_assumption,
+
+      chw_z = chw_gs,
+      z1_gs = Z1_gs,
+      z2_gs = Z2_gs,
+      z2_critical_chw = z2_critical_chw,
+      z2_critical_suff = z2_critical_suff,
+      p_value_full = p_value_full,
+      hypo_full = hypo_full,
+
+      original_chw_z = original_chw_z,
+      original_z2_gs = p_Z2_gs,
+      original_z2_critical_chw = original_z2_critical_chw,
+      original_p_value = original_p_value,
+      original_hypo = original_hypo,
+      original_full_z_gs = original_full_z_gs,
+      original_full_p_value = original_full_p_value,
+      original_full_hypo = original_full_hypo,
+
+      count_simu = NA_integer_,
+      mst_hat_1  = mst_hat_1,
+      mst_true_1 = mst_true_1,
+      mst_hat_2  = mst_hat_2,
+      mst_true_2 = mst_true_2,
+
+      mst_hat_overall  = mst_hat_overall,
+      mst_true_overall = mst_true_overall,
+
+      rmst_hat_1  = rmst_hat_1,
+      rmst_true_1 = rmst_true_1,
+      rmst_hat_2  = rmst_hat_2,
+      rmst_true_2 = rmst_true_2,
+
+      max_interim_time_1  = max(i_data_1$time),
+      mean_interim_time_1 = mean(i_data_1$time),
+      max_interim_time_2  = max(i_data_2$time),
+      mean_interim_time_2 = mean(i_data_2$time),
+
+      p1 = p1_raw,
+      p2 = p2_raw,
+
+      i1 = i1,
+      i2 = i2,
+
+      d_req_init = d,
+      d_target   = d_star,
+      nlhr_star  = nlhr_star,
+      logHR_hat  = logHR_hat,
+      stringsAsFactors = FALSE
+    )
+
+    required_valid_vars <- c(
+      "events_observed_interim",
+      "subjects_enrolled_interim",
+      "pct_planned_subjects_enrolled_interim",
+      "events_observed_final",
+      "subjects_enrolled_final",
+      "mst_hat_1",
+      "mst_true_1",
+      "mst_hat_2",
+      "mst_true_2",
+      "incD",
+      "D_ratio",
+      "ssr_relevant",
+      "incN",
+      "N_ratio",
+      "CP_interim",
+      "CP_after_SSR",
+      "original_hypo",
+      "hypo",
+      "original_p_value",
+      "p_value",
+      "p1",
+      "p2",
+      "d_target"
+    )
+
+    required_values <- unlist(
+      candidate_result[1, required_valid_vars, drop = FALSE],
+      use.names = FALSE
+    )
+
+    if (anyNA(required_values) ||
+        !all(is.finite(as.numeric(required_values)))) {
+      fail_saved_replicate_nonfinite <- fail_saved_replicate_nonfinite + 1L
+      next
+    }
+
+    count_simu <- count_simu + 1L
+    candidate_result$count_simu <- count_simu
+    final_results[[count_simu]] <- candidate_result
+  }
+
+  if (count_simu == 0L) return(NULL)
+  final_results <- do.call(rbind, final_results[seq_len(count_simu)])
+
+
+  n_simu <- nrow(final_results)
+  n_attempted_simulations <- as.integer(num_simulations)
+  n_valid_simulations <- as.integer(n_simu)
+  n_invalid_simulations <- as.integer(
+    n_attempted_simulations - n_valid_simulations
+  )
+
+
+  events_initial_planned <- ceiling(d)
+  subjects_initial_planned <- n
+  mean_events_observed_interim <- mean(final_results$events_observed_interim, na.rm = TRUE)
+  mean_subjects_enrolled_interim <- mean(final_results$subjects_enrolled_interim, na.rm = TRUE)
+  mean_pct_planned_subjects_enrolled_interim <- mean(
+    final_results$pct_planned_subjects_enrolled_interim, na.rm = TRUE
+  )
+  mean_events_observed_final <- mean(final_results$events_observed_final, na.rm = TRUE)
+  mean_subjects_enrolled_final <- mean(final_results$subjects_enrolled_final, na.rm = TRUE)
+
+  err1 <- (final_results$mst_hat_1 - final_results$mst_true_1) /
+    final_results$mst_true_1
+  err2 <- (final_results$mst_hat_2 - final_results$mst_true_2) /
+    final_results$mst_true_2
+  mst_rel_rmse_1 <- sqrt(mean(err1^2, na.rm = TRUE))
+  mst_rel_rmse_2 <- sqrt(mean(err2^2, na.rm = TRUE))
+  mst_rel_rmse_equalW <- sqrt((mst_rel_rmse_1^2 + mst_rel_rmse_2^2) / 2)
+
+  replicate_rmse_mst <- sqrt((err1^2 + err2^2) / 2)
+  sd_rmse_mst <- sd(replicate_rmse_mst, na.rm = TRUE)
+
+  rmst_err1 <- (final_results$rmst_hat_1 - final_results$rmst_true_1) /
+    final_results$rmst_true_1
+  rmst_err2 <- (final_results$rmst_hat_2 - final_results$rmst_true_2) /
+    final_results$rmst_true_2
+
+  rmst_rel_rmse_1 <- sqrt(mean(rmst_err1^2, na.rm = TRUE))
+  rmst_rel_rmse_2 <- sqrt(mean(rmst_err2^2, na.rm = TRUE))
+  rmst_rel_rmse_equalW <- sqrt(
+    (rmst_rel_rmse_1^2 + rmst_rel_rmse_2^2) / 2
+  )
+
+  replicate_rmse_rmst <- sqrt((rmst_err1^2 + rmst_err2^2) / 2)
+  sd_rmse_rmst <- sd(replicate_rmse_rmst, na.rm = TRUE)
+
+  p_incD      <- mean(final_results$incD == 1, na.rm = TRUE)
+  sd_incD     <- sd(final_results$incD, na.rm = TRUE)
+  mean_D_ratio <- mean(final_results$D_ratio, na.rm = TRUE)
+  sd_D_ratio   <- sd(final_results$D_ratio, na.rm = TRUE)
+
+  p_incN      <- mean(final_results$incN == 1, na.rm = TRUE)
+  sd_incN     <- sd(final_results$incN, na.rm = TRUE)
+  mean_N_ratio <- mean(final_results$N_ratio, na.rm = TRUE)
+  sd_N_ratio   <- sd(final_results$N_ratio, na.rm = TRUE)
+
+  mean_CP_interim   <- mean(final_results$CP_interim, na.rm = TRUE)
+  sd_CP_interim     <- sd(final_results$CP_interim, na.rm = TRUE)
+  mean_CP_after_SSR <- mean(final_results$CP_after_SSR, na.rm = TRUE)
+  sd_CP_after_SSR   <- sd(final_results$CP_after_SSR, na.rm = TRUE)
+
+  original_power_indicator <- as.numeric(final_results$original_hypo == 1)
+  final_power_indicator    <- as.numeric(final_results$hypo == 1)
+  original_power <- mean(original_power_indicator, na.rm = TRUE)
+  final_power    <- mean(final_power_indicator, na.rm = TRUE)
+  sd_original_power <- sd(original_power_indicator, na.rm = TRUE)
+  sd_final_power    <- sd(final_power_indicator, na.rm = TRUE)
+  mean_original_p_value <- mean(final_results$original_p_value, na.rm = TRUE)
+  sd_original_p_value   <- sd(final_results$original_p_value, na.rm = TRUE)
+  mean_final_p_value    <- mean(final_results$p_value, na.rm = TRUE)
+  sd_final_p_value      <- sd(final_results$p_value, na.rm = TRUE)
+
+  mean_p1 <- mean(final_results$p1, na.rm = TRUE)
+  sd_p1   <- sd(final_results$p1, na.rm = TRUE)
+  mean_p2 <- mean(final_results$p2, na.rm = TRUE)
+  sd_p2   <- sd(final_results$p2, na.rm = TRUE)
+
+
+  power_gain <- final_power - original_power
+  replicate_power_gain <- final_power_indicator - original_power_indicator
+  sd_power_gain <- sd(replicate_power_gain, na.rm = TRUE)
+
+  proportional_subject_increase <- mean_N_ratio - 1
+  new_performance_score <- if (
+    is.finite(proportional_subject_increase) &&
+      abs(proportional_subject_increase) > sqrt(.Machine$double.eps)
+  ) {
+    power_gain / proportional_subject_increase
+  } else {
+    NA_real_
+  }
+
+  replicate_proportional_subject_increase <- final_results$N_ratio - 1
+  replicate_power_gain_per_subject_increase <- ifelse(
+    is.finite(replicate_proportional_subject_increase) &
+      abs(replicate_proportional_subject_increase) > sqrt(.Machine$double.eps),
+    replicate_power_gain / replicate_proportional_subject_increase,
+    NA_real_
+  )
+  sd_power_gain_per_subject_increase <- sd(
+    replicate_power_gain_per_subject_increase,
+    na.rm = TRUE
+  )
+
+
+  n_invalid_from_failure_counters <- as.integer(
+    fail_interim_event_target +
+      fail_interim_arm_information +
+      fail_extrapolation_model +
+      fail_extrapolation_prediction +
+      fail_interim_logrank +
+      fail_conditional_power +
+      fail_ssr_target +
+      fail_final_event_target +
+      fail_final_logrank +
+      fail_original_final_logrank +
+      fail_saved_replicate_nonfinite
+  )
+
+  if (n_invalid_from_failure_counters != n_invalid_simulations) {
+    stop(
+      sprintf(
+        paste0(
+          "Simulation accounting error: attempted=%d, valid=%d, ",
+          "invalid_by_difference=%d, invalid_by_failure_counters=%d."
+        ),
+        n_attempted_simulations,
+        n_valid_simulations,
+        n_invalid_simulations,
+        n_invalid_from_failure_counters
+      )
+    )
+  }
+
+  report <- data.frame(
+    type = type,
+    rate1 = rate1,
+    rate2 = rate2,
+    c_shape_pre = c_shape_pre,
+    c_shape_post = c_shape_post,
+    c_scale_pre = c_scale_pre,
+    c_scale_post = c_scale_post,
+    t_shape_pre = t_shape_pre,
+    t_shape_post = t_shape_post,
+    t_scale_pre = t_scale_pre,
+    t_scale_post = t_scale_post,
+    change1 = change1,
+    change2 = change2,
+
+    Events_Initial_Planned = events_initial_planned,
+    Subjects_Initial_Planned = subjects_initial_planned,
+    Events_Observed_at_Interim = round(mean_events_observed_interim, 2),
+    Subjects_Enrolled_at_Interim = round(mean_subjects_enrolled_interim, 2),
+    Percent_Planned_Subjects_Enrolled_at_Interim =
+      round(mean_pct_planned_subjects_enrolled_interim, 2),
+    Events_Observed_at_Final_Analysis = round(mean_events_observed_final, 2),
+    Subjects_Enrolled_at_Final_Analysis = round(mean_subjects_enrolled_final, 2),
+
+    Probability_Increasing_Events = round(p_incD, 4),
+    SD_Probability_Increasing_Events = round(sd_incD, 4),
+    Mean_New_vs_Original_Events = round(mean_D_ratio, 4),
+    SD_New_vs_Original_Events = round(sd_D_ratio, 4),
+
+    Probability_Increasing_Subjects = round(p_incN, 4),
+    SD_Probability_Increasing_Subjects = round(sd_incN, 4),
+    Mean_New_vs_Original_Subjects = round(mean_N_ratio, 4),
+    SD_New_vs_Original_Subjects = round(sd_N_ratio, 4),
+
+    Conditional_Power_at_Interim = round(mean_CP_interim, 4),
+    SD_Conditional_Power_at_Interim = round(sd_CP_interim, 4),
+    Original_Power_CHW_No_Resize = round(original_power, 4),
+    SD_Original_Power_CHW_No_Resize = round(sd_original_power, 4),
+    Final_Power_CHW_After_SSR = round(final_power, 4),
+    SD_Final_Power_CHW_After_SSR = round(sd_final_power, 4),
+    Original_Mean_P_value_CHW = round(mean_original_p_value, 4),
+    SD_Original_P_value_CHW = round(sd_original_p_value, 4),
+    Final_Mean_P_value_CHW = round(mean_final_p_value, 4),
+    SD_Final_P_value_CHW = round(sd_final_p_value, 4),
+
+    Estimated_p1 = round(mean_p1, 4),
+    SD_Estimated_p1 = round(sd_p1, 4),
+    Estimated_p2 = round(mean_p2, 4),
+    SD_Estimated_p2 = round(sd_p2, 4),
+    RMSE_MST = round(mst_rel_rmse_equalW, 4),
+    SD_RMSE_MST = round(sd_rmse_mst, 4),
+    RMSE_RMST = round(rmst_rel_rmse_equalW, 4),
+    SD_RMSE_RMST = round(sd_rmse_rmst, 4),
+
+    New_Power_Gain_Per_Subject_Increase_Score = round(new_performance_score, 4),
+    SD_Power_Gain_Per_Subject_Increase = round(sd_power_gain_per_subject_increase, 4),
+    Power_Gain = round(power_gain, 4),
+    SD_Power_Gain = round(sd_power_gain, 4),
+    Proportional_Increase_in_Subjects = round(proportional_subject_increase, 4),
+    Number_of_Valid_Simulations = n_valid_simulations,
+    Number_of_Invalid_Simulations = n_invalid_simulations,
+    Invalid_Interim_Event_Target = fail_interim_event_target,
+    Invalid_Interim_Arm_Information = fail_interim_arm_information,
+    Invalid_Extrapolation_Model = fail_extrapolation_model,
+    Invalid_Extrapolation_Prediction = fail_extrapolation_prediction,
+    Invalid_Interim_Logrank = fail_interim_logrank,
+    Invalid_Conditional_Power = fail_conditional_power,
+    Invalid_SSR_Target = fail_ssr_target,
+    Invalid_Final_Event_Target = fail_final_event_target,
+    Invalid_Final_Logrank = fail_final_logrank,
+    Invalid_Original_Final_Logrank = fail_original_final_logrank,
+    Invalid_Saved_Replicate_Nonfinite = fail_saved_replicate_nonfinite,
+    rec = rec_length,
+
+    stringsAsFactors = FALSE
+  )
+
+  row.names(report) <- NULL
+
+  return(report)
+}
+
+
+result_headers <- c(
+  "Type",
+  "Control Rate Assumption", "Treatment Rate Assumption",
+  "Control Shape (Pre)", "Control Shape (Post)",
+  "Control Scale (Pre)", "Control Scale (Post)",
+  "Treatment Shape (Pre)", "Treatment Shape (Post)",
+  "Treatment Scale (Pre)", "Treatment Scale (Post)",
+  "Control Change Point", "Treatment Change Point",
+
+  "Number of Events Initial Planned",
+  "Number of Subjects Initial Planned",
+  "Number of Events Observed at Interim",
+  "Number of Subjects Enrolled at Interim",
+  "Percentage of Planned Subjects Enrolled at Interim",
+  "Number of Events Observed at Final Analysis",
+  "Number of Subjects Enrolled at Final Analysis",
+
+  "Probability of Increasing Events",
+  "SD of Probability of Increasing Events",
+  "New vs Original Sample Size in Events",
+  "SD of New vs Original Sample Size in Events",
+
+  "Probability of Increasing Subjects",
+  "SD of Probability of Increasing Subjects",
+  "New vs Original Sample Size in Subjects",
+  "SD of New vs Original Sample Size in Subjects",
+
+  "Conditional Power at Interim",
+  "SD of Conditional Power at Interim",
+  "Original Power at End",
+  "SD of Original Power at End",
+  "Final Power After SSR",
+  "SD of Final Power After SSR",
+  "Original P-value",
+  "SD of Original P-value",
+  "Final P-value",
+  "SD of Final P-value",
+
+  "Estimated p1", "SD of Estimated p1",
+  "Estimated p2", "SD of Estimated p2",
+  "Relative RMSE of MST",
+  "SD of Relative RMSE of MST",
+  "Relative RMSE of RMST (fixed horizon = 5 years)",
+  "SD of Relative RMSE of RMST (fixed horizon = 5 years)",
+  "Power Gain per Proportional Subject Increase",
+  "SD of Power Gain per Proportional Subject Increase",
+  "Power Gain",
+  "SD of Power Gain",
+  "Proportional Increase in Sample Size (Subjects)",
+  "Number of valid simulations",
+  "Number of invalid simulations",
+  "Invalid: interim event target not reached",
+  "Invalid: insufficient interim arm information",
+  "Invalid: extrapolation model failure",
+  "Invalid: extrapolation prediction failure",
+  "Invalid: interim log-rank failure",
+  "Invalid: conditional power failure",
+  "Invalid: SSR target failure",
+  "Invalid: final event target not reached",
+  "Invalid: final log-rank failure",
+  "Invalid: original final log-rank failure",
+    "Invalid: saved replicate nonfinite",
+  "rec"
+)
+
+
+common_export_front_headers <- c(
+  "Type",
+  "Control Rate Assumption",
+  "Treatment Rate Assumption",
+  "DGM Family / Pattern",
+  "Scenario",
+  "Control Distribution Parameters",
+  "Treatment Distribution Parameters",
+  "Before-Change Treatment Effect",
+  "After-Change Treatment Effect",
+  "Additional DGM Information",
+  "Calibrated Fixed-Design Power Target",
+  "Control Change Point",
+  "Treatment Change Point"
+)
+
+common_distribution_description_headers <- c(
+  "Before Change Distribution",
+  "After Change Distribution",
+  "Overall Distribution"
+)
+
+infer_piecewise_pattern_from_path <- function(file_path) {
+  b <- basename(file_path)
+  if (grepl("crossing", b, ignore.case = TRUE)) return("crossing")
+  if (grepl("diverging", b, ignore.case = TRUE)) return("diverging")
+  if (grepl("diminishing", b, ignore.case = TRUE)) return("diminishing")
+  if (grepl("_PH_", b, ignore.case = TRUE) || grepl("PH", b, ignore.case = TRUE)) return("PH")
+  if (grepl("reversed", b, ignore.case = TRUE)) return("reversed")
+  if (grepl("H0", b, ignore.case = TRUE)) return("H0")
+  "unspecified"
+}
+
+standardize_piecewise_weibull_export <- function(final_sav, file_path) {
+  if (is.null(final_sav) || nrow(final_sav) == 0) return(final_sav)
+  pat <- infer_piecewise_pattern_from_path(file_path)
+  control_pars <- paste0(
+    "Pre Weibull(shape=", final_sav$c_shape_pre, ", scale=", final_sav$c_scale_pre,
+    "); Post Weibull(shape=", final_sav$c_shape_post, ", scale=", final_sav$c_scale_post, ")"
+  )
+  treatment_pars <- paste0(
+    "Pre Weibull(shape=", final_sav$t_shape_pre, ", scale=", final_sav$t_scale_pre,
+    "); Post Weibull(shape=", final_sav$t_shape_post, ", scale=", final_sav$t_scale_post, ")"
+  )
+  before_eff <- paste0(
+    "Control Weibull(shape=", final_sav$c_shape_pre, ", scale=", final_sav$c_scale_pre,
+    ") vs Treatment Weibull(shape=", final_sav$t_shape_pre, ", scale=", final_sav$t_scale_pre, ")"
+  )
+  after_eff <- paste0(
+    "Control Weibull(shape=", final_sav$c_shape_post, ", scale=", final_sav$c_scale_post,
+    ") vs Treatment Weibull(shape=", final_sav$t_shape_post, ", scale=", final_sav$t_scale_post, ")"
+  )
+  front <- data.frame(
+    Type = final_sav$type,
+    rate1 = final_sav$rate1,
+    rate2 = final_sav$rate2,
+    family = "PiecewiseWeibull",
+    scenario = pat,
+    control = control_pars,
+    treatment = treatment_pars,
+    before_effect = before_eff,
+    after_effect = after_eff,
+    additional = "Fixed follow-up duration = 5 years",
+    target = NA_real_,
+    change1 = final_sav$change1,
+    change2 = final_sav$change2,
+    stringsAsFactors = FALSE
+  )
+  results <- final_sav[, -(1:13), drop = FALSE]
+  desc <- data.frame(
+    before = paste0("Before t=1: ", before_eff),
+    after  = paste0("After t=1: ", after_eff),
+    overall = paste0("Piecewise Weibull ", pat, " pattern; change point=1; fixed follow-up=5"),
+    stringsAsFactors = FALSE
+  )
+  out <- cbind(front, results, desc)
+  colnames(out) <- c(common_export_front_headers, result_headers[-(1:13)], common_distribution_description_headers)
+  out <- out[, c(setdiff(names(out), "rec"), "rec"), drop = FALSE]
+  out
+}
+
+standardize_complex_export <- function(final_sav) {
+  if (is.null(final_sav) || nrow(final_sav) == 0) return(final_sav)
+  front <- data.frame(
+    Type = final_sav[[1]],
+    rate1 = final_sav[[2]],
+    rate2 = final_sav[[3]],
+    family = final_sav[[4]],
+    scenario = final_sav[[5]],
+    control = final_sav[[7]],
+    treatment = final_sav[[13]],
+    before_effect = final_sav[[9]],
+    after_effect = final_sav[[11]],
+    additional = final_sav[[10]],
+    target = final_sav[[6]],
+    change1 = NA_real_,
+    change2 = NA_real_,
+    stringsAsFactors = FALSE
+  )
+  results <- final_sav[, -(1:13), drop = FALSE]
+  desc <- data.frame(
+    before = paste0("Early/before-change component: ", final_sav[[9]]),
+    after = paste0("Late/after-change component: ", final_sav[[11]]),
+    overall = paste0(final_sav[[4]], "; ", final_sav[[13]]),
+    stringsAsFactors = FALSE
+  )
+  out <- cbind(front, results, desc)
+  colnames(out) <- c(common_export_front_headers, result_headers[-(1:13)], common_distribution_description_headers)
+  out <- out[, c(setdiff(names(out), "rec"), "rec"), drop = FALSE]
+  out
+}
+
+standardize_piecewise_lognormal_export <- function(final_sav, file_path) {
+  if (is.null(final_sav) || nrow(final_sav) == 0) return(final_sav)
+  pat <- infer_piecewise_pattern_from_path(file_path)
+  control_pars <- paste0(
+    "Pre LogNormal(meanlog=", final_sav$c_shape_pre, ", sdlog=", final_sav$c_scale_pre,
+    "); Post LogNormal(meanlog=", final_sav$c_shape_post, ", sdlog=", final_sav$c_scale_post, ")"
+  )
+  treatment_pars <- paste0(
+    "Piecewise HR multipliers: pre=", final_sav$t_shape_pre,
+    "; post=", final_sav$t_shape_post,
+    "; applied to the same piecewise log-normal baseline"
+  )
+  before_eff <- paste0("Treatment HR multiplier before change=", final_sav$t_shape_pre)
+  after_eff <- paste0("Treatment HR multiplier after change=", final_sav$t_shape_post)
+  front <- data.frame(
+    Type = final_sav$type,
+    rate1 = final_sav$rate1,
+    rate2 = final_sav$rate2,
+    family = paste0("PiecewiseLogNormal_", pat),
+    scenario = final_sav$type,
+    control = control_pars,
+    treatment = treatment_pars,
+    before_effect = before_eff,
+    after_effect = after_eff,
+    additional = "Fixed follow-up duration = 5 years",
+    target = NA_real_,
+    change1 = final_sav$change1,
+    change2 = final_sav$change2,
+    stringsAsFactors = FALSE
+  )
+  results <- final_sav[, -(1:13), drop = FALSE]
+  desc <- data.frame(
+    before = paste0("Before t=1: control log-normal baseline; ", before_eff),
+    after = paste0("After t=1: control log-normal baseline; ", after_eff),
+    overall = paste0("Piecewise log-normal ", pat, " pattern; exact segment-specific HRs; change point=1; fixed follow-up=5"),
+    stringsAsFactors = FALSE
+  )
+  out <- cbind(front, results, desc)
+  colnames(out) <- c(common_export_front_headers, result_headers[-(1:13)], common_distribution_description_headers)
+  out <- out[, c(setdiff(names(out), "rec"), "rec"), drop = FALSE]
+  out
+}
+
+
+save_result_file <- function(final_sav, file_path, headers, sheet_name = "Sheet 1") {
+
+  if (nrow(final_sav) > 0) {
+    final_sav <- final_sav[order(
+      final_sav$type,
+      final_sav$rate1, final_sav$rate2,
+      final_sav$c_shape_pre,  final_sav$c_shape_post,
+      final_sav$c_scale_pre,  final_sav$c_scale_post,
+      final_sav$t_shape_pre,  final_sav$t_shape_post,
+      final_sav$t_scale_pre,  final_sav$t_scale_post
+    ), ]
+
+    final_sav <- standardize_piecewise_weibull_export(final_sav, file_path)
+  }
+
+  wb <- if (file.exists(file_path)) loadWorkbook(file_path) else createWorkbook()
+
+  if (!(sheet_name %in% names(wb))) {
+    addWorksheet(wb, sheet_name)
+  }
+
+  if (sheet_name %in% names(wb)) {
+    removeWorksheet(wb, sheet_name)
+    addWorksheet(wb, sheet_name)
+  }
+
+  if (nrow(final_sav) > 0) {
+    writeData(wb, sheet = sheet_name, x = final_sav)
+  }
+
+  saveWorkbook(wb, file = file_path, overwrite = TRUE)
+  cat("Excel file saved to:", file_path, "\n")
+}
+
+directory_path <- "C:/Users/admin/Downloads/fixed_followup_H1/nonparametric_fixed_followup"
+
+if (!dir.exists(directory_path)) dir.create(directory_path, recursive = TRUE)
+
+
+# Run piecewise Weibull scenarios
+run_scenario_family <- function(extrap_dist, scenario, scenario_seed,
+                                num_simulations = 1000, checkpoint_file = NULL) {
+  final_sav <- data.frame()
+  if (!is.null(checkpoint_file)) save_result_file(final_sav, checkpoint_file, result_headers)
+  set.seed(scenario_seed)
+
+  h1_effect_pre <- list(
+    crossing = draw_uniform_range(12, 0.03, 0.06, 12011, decreasing = TRUE),
+    diverging = draw_uniform_range(12, 0.14, 0.25, 12012),
+    PH = draw_uniform_range(12, 0.65, 1.15, 12013, decreasing = TRUE),
+    diminishing = draw_uniform_range(12, 1.0, 1.35, 12014)
+  )
+  h1_effect_post <- list(
+    crossing = draw_uniform_range(12, 0.3, 0.75, 12021),
+    diverging = draw_uniform_range(12, 0.5, 0.95, 12022),
+    PH = h1_effect_pre$PH,
+    diminishing = draw_uniform_range(12, 0.65, 0.95, 12024, decreasing = TRUE)
+  )
+
+  ph_common_hr <- draw_uniform_range(
+    12, 0.60, 0.72, 12031, decreasing = TRUE
+  )
+  scenario_index <- 0L
+  grid_index <- 0L
+
+  for (sp1 in seq(0.8, 1.2, by = 0.2)) {
+    for (sp2 in seq(sp1 - 0.3, sp1 - 0.1, by = 0.2)) {
+      for (s1 in seq(3, 5, by = 2)) {
+        for (s2 in (s1 + 4)) {
+          grid_index <- grid_index + 1L
+
+          if (scenario == "H0") {
+            pars <- list(
+              c_shape_pre = sp1 - 0.18,
+              c_shape_post = sp2 * 0.8,
+              c_scale_pre = s1 + 3,
+              c_scale_post = s2,
+              t_shape_pre = sp1 - 0.18,
+              t_shape_post = sp2 * 0.8,
+              t_scale_pre = s1 + 3,
+              t_scale_post = s2
+            )
+          } else if (scenario == "H0_reversed") {
+            pars <- list(
+              c_shape_pre = sp1 - 0.18,
+              c_shape_post = sp2 * 0.8,
+              c_scale_pre = s1 + 3,
+              c_scale_post = s2,
+              t_shape_pre = (sp1 - 0.18) * 0.97,
+              t_shape_post = (sp2 * 0.8) * 0.95,
+              t_scale_pre = (s1 + 3) * 0.88,
+              t_scale_post = s2 * 0.8
+            )
+          } else if (scenario == "crossing") {
+            pars <- list(
+              c_shape_pre = sp1 - 0.18,
+              c_shape_post = sp2 * 0.8,
+              c_scale_pre = s1 + 3,
+              c_scale_post = s1,
+              t_shape_pre = sp1 - 0.2,
+              t_shape_post = sp2 * 1.05,
+              t_scale_pre = s1 + 2.8,
+              t_scale_post = s2 + 7
+            )
+          } else if (scenario == "diverging") {
+            pars <- list(
+              c_shape_pre = sp1 - 0.18,
+              c_shape_post = sp2 * 0.8,
+              c_scale_pre = s1 + 3,
+              c_scale_post = s1,
+              t_shape_pre  = sp1 - 0.17,
+              t_shape_post = sp2,
+              t_scale_pre  = s1 + 3.8,
+              t_scale_post = s2 + 4
+            )
+          } else if (scenario == "PH") {
+            pars <- list(
+              c_shape_pre = sp1 - 0.18,
+              c_shape_post = sp2 * 0.8,
+              c_scale_pre = s1 + 3,
+              c_scale_post = s1,
+              t_shape_pre = sp1 - 0.18,
+              t_shape_post = sp2 * 0.8,
+              t_scale_pre = s1 + 3,
+              t_scale_post = s1
+            )
+          } else if (scenario == "diminishing") {
+            pars <- list(
+              c_shape_pre  = sp1 - 0.18,
+              c_shape_post = sp2 * 0.8,
+              c_scale_pre  = s1 + 3,
+              c_scale_post = s1,
+
+              t_shape_pre  = sp1 - 0.15,
+              t_shape_post = sp2 * 0.81,
+              t_scale_pre  = s1 + 10.2,
+              t_scale_post = s1 + 6.6
+            )
+          } else {
+            stop("Unknown scenario: ", scenario)
+          }
+
+          if (scenario %in% c("crossing", "diverging", "PH", "diminishing")) {
+            scenario_index <- scenario_index + 1L
+
+            if (scenario == "PH") {
+              hr_ph <- ph_common_hr[scenario_index]^1.38
+              pars$t_shape_pre  <- pars$c_shape_pre
+              pars$t_shape_post <- pars$c_shape_post
+              pars$t_scale_pre  <- pars$c_scale_pre / hr_ph^(1 / pars$c_shape_pre)
+              pars$t_scale_post <- pars$c_scale_post / hr_ph^(1 / pars$c_shape_post)
+            } else {
+              f_pre  <- h1_effect_pre[[scenario]][scenario_index]
+              f_post <- h1_effect_post[[scenario]][scenario_index]
+
+              if (scenario %in% c("crossing", "diverging")) {
+                f_pre  <- 1.1 * f_pre
+                f_post <- 1.1 * f_post
+              }
+
+              if (scenario %in% c("crossing", "diverging")) {
+                f_pre  <- 0.55 * f_pre
+                f_post <- 1.55 * f_post
+              } else if (scenario == "diminishing") {
+                f_pre  <- 1.45 * f_pre
+                f_post <- 0.55 * f_post
+              }
+
+              if (scenario == "crossing") {
+                f_pre  <- 0.95 * f_pre
+                f_post <- 0.65 * f_post
+              } else if (scenario == "diverging") {
+                f_pre  <- 0.85 * f_pre
+                f_post <- 0.85 * f_post
+              }
+
+              if (scenario == "diverging") {
+                f_pre  <- 0.8 * f_pre
+                f_post <- 0.8 * f_post
+              }
+
+              if (scenario == "crossing") {
+                f_pre  <- 1.08 * f_pre
+                f_post <- 0.92 * f_post
+              } else if (scenario == "diverging") {
+                f_pre  <- 1.12 * f_pre
+                f_post <- 1.18 * f_post
+              } else if (scenario == "diminishing") {
+                f_pre  <- 0.86 * f_pre
+                f_post <- 1.20 * f_post
+              }
+
+              if (scenario == "crossing") {
+                .pw_cross_pre  <- seq(0.34, 0.46, length.out = 12)[scenario_index]
+                .pw_cross_post <- seq(0.72, 0.88, length.out = 12)[scenario_index]
+                f_pre  <- .pw_cross_pre
+                f_post <- .pw_cross_post
+              } else if (scenario == "diverging") {
+                .pw_div_pre  <- seq(0.16, 0.24, length.out = 12)[scenario_index]
+                .pw_div_post <- seq(0.42, 0.58, length.out = 12)[scenario_index]
+                f_pre  <- .pw_div_pre
+                f_post <- .pw_div_post
+              }
+
+              if (scenario == "crossing") {
+                f_pre  <- 0.80 * f_pre
+                f_post <- 0.80 * f_post
+              } else if (scenario == "diverging") {
+                .pw_div_mid_pre  <- 0.205
+                .pw_div_mid_post <- 0.505
+                f_pre  <- .pw_div_mid_pre  + 0.30 * (f_pre  - .pw_div_mid_pre)
+                f_post <- .pw_div_mid_post + 0.30 * (f_post - .pw_div_mid_post)
+              }
+
+              if (scenario == "crossing") {
+                f_pre  <- 0.76 * f_pre
+                f_post <- 0.80 * f_post
+              } else if (scenario == "diverging") {
+                .pw_div_mid_pre2  <- 0.205
+                .pw_div_mid_post2 <- 0.505
+                f_pre  <- .pw_div_mid_pre2  + 0.12 * (f_pre  - .pw_div_mid_pre2)
+                f_post <- .pw_div_mid_post2 + 0.12 * (f_post - .pw_div_mid_post2)
+              }
+
+              if (scenario == "crossing") {
+                f_pre  <- 0.88 * f_pre
+                f_post <- 0.92 * f_post
+              } else if (scenario == "diverging") {
+                f_pre  <- 1.10 * f_pre
+                f_post <- 1.16 * f_post
+              }
+
+              pars$t_shape_pre <- pars$c_shape_pre +
+                f_pre * (pars$t_shape_pre - pars$c_shape_pre)
+              pars$t_shape_post <- pars$c_shape_post +
+                f_post * (pars$t_shape_post - pars$c_shape_post)
+              pars$t_scale_pre <- pars$c_scale_pre +
+                f_pre * (pars$t_scale_pre - pars$c_scale_pre)
+              pars$t_scale_post <- pars$c_scale_post +
+                f_post * (pars$t_scale_post - pars$c_scale_post)
+            }
+          }
+
+          if (grid_index %% 2L == 0L) next
+
+          if (scenario %in% c("crossing", "diverging")) {
+            .pw_retained_index <- (grid_index + 1L) %/% 2L
+            .pw_rec_values <- seq(3.5, 5.5, by = 1)
+
+            .pw_rec_results <- lapply(seq_along(.pw_rec_values), function(.pw_rec_index) {
+              .pw_output_row <- (.pw_retained_index - 1L) * 3L + .pw_rec_index
+              .pw_pars <- pars
+
+              if (.pw_output_row <= 10L) {
+                .pw_f_pre  <- 1.24
+                .pw_f_post <- 1.36
+              } else if (.pw_output_row >= 16L) {
+                .pw_f_pre  <- 0.88
+                .pw_f_post <- 0.92
+              } else {
+                .pw_f_pre  <- 1.00
+                .pw_f_post <- 1.00
+              }
+
+              .pw_pars$t_shape_pre <- .pw_pars$c_shape_pre +
+                .pw_f_pre * (.pw_pars$t_shape_pre - .pw_pars$c_shape_pre)
+              .pw_pars$t_shape_post <- .pw_pars$c_shape_post +
+                .pw_f_post * (.pw_pars$t_shape_post - .pw_pars$c_shape_post)
+              .pw_pars$t_scale_pre <- .pw_pars$c_scale_pre +
+                .pw_f_pre * (.pw_pars$t_scale_pre - .pw_pars$c_scale_pre)
+              .pw_pars$t_scale_post <- .pw_pars$c_scale_post +
+                .pw_f_post * (.pw_pars$t_scale_post - .pw_pars$c_scale_post)
+
+              validate_piecewise_weibull_label(
+                scenario, .pw_pars, change_point = 1, horizon = 5
+              )
+
+              do.call(
+                simu,
+                c(
+                  list(
+                    type = "Unblinded", alpha = 0.05, beta = 0.1,
+                    rate1 = 0.6, rate2 = 0.4,
+                    change1 = 1, change2 = 1,
+                    rec = .pw_rec_values[.pw_rec_index], CL = 0.2, CU = 0.9,
+                    num_simulations = num_simulations,
+                    extrap_dist = extrap_dist
+                  ),
+                  .pw_pars
+                )
+              )
+            })
+
+            .pw_rec_results <- .pw_rec_results[
+              !vapply(.pw_rec_results, is.null, logical(1))
+            ]
+            sav1 <- if (length(.pw_rec_results) == 0L) NULL else
+              do.call(rbind, .pw_rec_results)
+          } else {
+            validate_piecewise_weibull_label(
+              scenario, pars, change_point = 1, horizon = 5
+            )
+
+            sav1 <- do.call(
+              simu,
+              c(
+                list(
+                  type = "Unblinded", alpha = 0.05, beta = 0.1,
+                  rate1 = 0.6, rate2 = 0.4,
+                  change1 = 1, change2 = 1,
+                  rec = seq(3.5, 5.5, by = 1), CL = 0.2, CU = 0.9,
+                  num_simulations = num_simulations,
+                  extrap_dist = extrap_dist
+                ),
+                pars
+              )
+            )
+          }
+
+          if (!is.null(sav1)) {
+            final_sav <- rbind(final_sav, sav1)
+            if (!is.null(checkpoint_file)) save_result_file(final_sav, checkpoint_file, result_headers)
+          }
+        }
+      }
+    }
+  }
+
+  final_sav
+}
+
+# Output settings
+extrapolation_methods <- c(
+  diff_mean = "Unblinded_diff_mean",
+  diff_last = "Unblinded_diff_last"
+)
+
+scenario_definitions <- data.frame(
+  scenario = c(
+    "crossing", "diverging", "PH",
+    "diminishing"
+  ),
+  seed = c(
+    1234567, 2234567, 3234567,
+    4234567
+  ),
+  file_stub = c(
+    "H1_Unblinded_crossing_PiecewiseWeibull",
+    "H1_Unblinded_diverging_PiecewiseWeibull",
+    "H1_Unblinded_PH_PiecewiseWeibull",
+    "H1_Unblinded_diminishing_PiecewiseWeibull"
+  ),
+  stringsAsFactors = FALSE
+)
+
+num_simulations_per_scenario <- 1000
+
+
+# Generate piecewise Weibull outputs
+generate_one_output <- function(task) {
+  method_key <- task$method_key
+  method_label <- unname(extrapolation_methods[method_key])
+  j <- task$index
+
+  final_sav <- run_scenario_family(
+    extrap_dist = method_key,
+    scenario = scenario_definitions$scenario[j],
+    scenario_seed = scenario_definitions$seed[j],
+    num_simulations = num_simulations_per_scenario,
+    checkpoint_file = file.path(
+      directory_path,
+      paste0(scenario_definitions$file_stub[j], "_", method_label, ".xlsx")
+    )
+  )
+
+  file_path <- file.path(
+    directory_path,
+    paste0(scenario_definitions$file_stub[j], "_", method_label, ".xlsx")
+  )
+  save_result_file(final_sav, file_path, result_headers)
+  file_path
+}
+
+get_ssr_n_cores <- function() {
+  requested <- suppressWarnings(as.integer(Sys.getenv("SSR_N_CORES", unset = NA_character_)))
+  if (is.finite(requested) && requested >= 1L) return(requested)
+  1L
+}
+
+run_all_outputs <- function(output_set = c("both", "piecewise_weibull", "piecewise_lognormal")) {
+  output_set <- match.arg(output_set)
+
+  dgm_groups <- if (output_set == "both") {
+    c("piecewise_lognormal", "piecewise_weibull")
+  } else {
+    output_set
+  }
+
+  all_generated_files <- character(0)
+
+  for (dgm_group in dgm_groups) {
+    cat("\n============================================================\n")
+    cat("STARTING DGM GROUP:", dgm_group, "\n")
+    cat("============================================================\n")
+
+    tasks <- list()
+    kk <- 0L
+
+    if (dgm_group == "piecewise_weibull") {
+      for (method_key in names(extrapolation_methods)) {
+        for (j in seq_len(nrow(scenario_definitions))) {
+          kk <- kk + 1L
+          tasks[[kk]] <- list(
+            dgm_group = dgm_group,
+            method_key = method_key,
+            index = j
+          )
+        }
+      }
+    } else {
+      for (method_key in names(extrapolation_methods)) {
+        for (j in seq_len(nrow(piecewise_lognormal_definitions))) {
+          kk <- kk + 1L
+          tasks[[kk]] <- list(
+            dgm_group = dgm_group,
+            method_key = method_key,
+            index = j
+          )
+        }
+      }
+    }
+
+    generate_dgm_output <- function(task) {
+      if (task$dgm_group == "piecewise_weibull") {
+        return(generate_one_output(task))
+      }
+
+      method_key <- task$method_key
+      method_label <- unname(extrapolation_methods[method_key])
+      j <- task$index
+      pattern <- piecewise_lognormal_definitions$pattern[j]
+
+      final_ln <- run_piecewise_lognormal_family(
+        extrap_dist = method_key,
+        pattern = pattern,
+        family_seed = piecewise_lognormal_definitions$seed[j],
+        num_simulations = num_simulations_per_scenario,
+        checkpoint_file = file.path(
+          directory_path,
+          paste0(
+            piecewise_lognormal_definitions$file_stub[j],
+            "_", method_label, ".xlsx"
+          )
+        )
+      )
+
+      file_path <- file.path(
+        directory_path,
+        paste0(
+          piecewise_lognormal_definitions$file_stub[j],
+          "_", method_label, ".xlsx"
+        )
+      )
+      save_piecewise_lognormal_result_file(final_ln, file_path)
+      file_path
+    }
+
+    n_cores <- min(get_ssr_n_cores(), length(tasks))
+    cat("Output-level parallel workers:", n_cores, "\n")
+    cat("Simulations per scenario remain:", num_simulations_per_scenario, "\n")
+    cat("Number of output tasks:", length(tasks), "\n")
+
+    if (n_cores <= 1L) {
+      generated_files <- lapply(tasks, generate_dgm_output)
+    } else if (.Platform$OS.type != "windows") {
+      generated_files <- parallel::mclapply(
+        tasks,
+        generate_dgm_output,
+        mc.cores = n_cores,
+        mc.preschedule = FALSE
+      )
+    } else {
+      cl <- parallel::makeCluster(n_cores)
+      parallel::clusterExport(
+        cl,
+        varlist = ls(envir = .GlobalEnv),
+        envir = .GlobalEnv
+      )
+      parallel::clusterExport(
+        cl,
+        varlist = c("generate_dgm_output"),
+        envir = environment()
+      )
+      generated_files <- parallel::parLapply(cl, tasks, generate_dgm_output)
+      parallel::stopCluster(cl)
+    }
+
+    generated_files <- unlist(generated_files, use.names = FALSE)
+    all_generated_files <- c(all_generated_files, generated_files)
+
+    cat("============================================================\n")
+    cat("COMPLETED DGM GROUP:", dgm_group, "\n")
+    cat("Number of files:", length(generated_files), "\n")
+    cat("============================================================\n")
+  }
+
+  invisible(all_generated_files)
+}
+
+piecewise_lognormal_change <- 1
+
+S_lognormal_segment <- function(t, meanlog, sdlog) {
+  t <- pmax(as.numeric(t), 0)
+  out <- rep(1, length(t))
+  pos <- t > 0
+  if (any(pos)) {
+    out[pos] <- plnorm(
+      t[pos], meanlog = meanlog, sdlog = sdlog,
+      lower.tail = FALSE
+    )
+  }
+  pmin(pmax(out, 0), 1)
+}
+
+# Piecewise log-normal functions
+H_lognormal_segment <- function(t, meanlog, sdlog) {
+  s <- S_lognormal_segment(t, meanlog, sdlog)
+  -log(pmax(s, 1e-15))
+}
+
+qH_lognormal_segment <- function(z, meanlog, sdlog) {
+  z <- pmax(as.numeric(z), 0)
+  p <- 1 - exp(-z)
+  p <- pmin(pmax(p, 1e-12), 1 - 1e-12)
+  qlnorm(p, meanlog = meanlog, sdlog = sdlog)
+}
+
+rlognormal_piecewise_hr <- function(n,
+                                    meanlog_pre, sdlog_pre,
+                                    meanlog_post, sdlog_post,
+                                    hr_pre = 1, hr_post = 1,
+                                    c = piecewise_lognormal_change) {
+  if (!is.finite(hr_pre) || !is.finite(hr_post) ||
+      hr_pre <= 0 || hr_post <= 0) {
+    stop("hr_pre and hr_post must both be finite and > 0.")
+  }
+
+  if (c <= 0) {
+    z <- rexp(n, rate = 1)
+    return(qH_lognormal_segment(z / hr_post, meanlog_post, sdlog_post))
+  }
+
+  z <- rexp(n, rate = 1)
+  Hc0 <- H_lognormal_segment(c, meanlog_pre, sdlog_pre)
+  HcT <- hr_pre * Hc0
+  out <- numeric(n)
+
+  before <- z <= HcT
+  if (any(before)) {
+    out[before] <- qH_lognormal_segment(
+      z[before] / hr_pre,
+      meanlog = meanlog_pre, sdlog = sdlog_pre
+    )
+  }
+  if (any(!before)) {
+    out[!before] <- c + qH_lognormal_segment(
+      (z[!before] - HcT) / hr_post,
+      meanlog = meanlog_post, sdlog = sdlog_post
+    )
+  }
+  out
+}
+
+S_lognormal_piecewise_hr <- function(t,
+                                     meanlog_pre, sdlog_pre,
+                                     meanlog_post, sdlog_post,
+                                     hr_pre = 1, hr_post = 1,
+                                     c = piecewise_lognormal_change) {
+  if (!is.finite(hr_pre) || !is.finite(hr_post) ||
+      hr_pre <= 0 || hr_post <= 0) {
+    stop("hr_pre and hr_post must both be finite and > 0.")
+  }
+
+  t <- pmax(as.numeric(t), 0)
+  H <- numeric(length(t))
+  pre <- t <= c
+  Hc0 <- H_lognormal_segment(c, meanlog_pre, sdlog_pre)
+
+  if (any(pre)) {
+    H[pre] <- hr_pre * H_lognormal_segment(
+      t[pre], meanlog = meanlog_pre, sdlog = sdlog_pre
+    )
+  }
+  if (any(!pre)) {
+    H[!pre] <- hr_pre * Hc0 +
+      hr_post * H_lognormal_segment(
+        t[!pre] - c, meanlog = meanlog_post, sdlog = sdlog_post
+      )
+  }
+
+  out <- exp(-H)
+  out[t == 0] <- 1
+  pmin(pmax(out, 0), 1)
+}
+
+piecewise_lognormal_baseline <- expand.grid(
+  control_pre_median  = c(2.2, 2.8, 3.4),
+  control_pre_sdlog   = c(0.6, 0.8),
+  control_post_median = c(1.5, 2.5),
+  KEEP.OUT.ATTRS = FALSE,
+  stringsAsFactors = FALSE
+)
+piecewise_lognormal_baseline$control_post_sdlog <- 0.7
+piecewise_lognormal_baseline <- piecewise_lognormal_baseline[c(1,3,5,8,10,12), , drop = FALSE]
+rownames(piecewise_lognormal_baseline) <- NULL
+piecewise_lognormal_baseline$baseline_id <- seq_len(nrow(piecewise_lognormal_baseline))
+
+piecewise_lognormal_effects <- list(
+  crossing    = c(hr_pre = 1.45, hr_post = 0.48),
+  diverging   = c(hr_pre = 0.93, hr_post = 0.48),
+  PH          = c(hr_pre = 0.6, hr_post = 0.6),
+  diminishing = c(hr_pre = 0.3, hr_post = 0.78)
+)
+
+validate_piecewise_lognormal_hr_pattern <- function(pattern, hr_pre, hr_post,
+                                                    tol = 1e-12) {
+  ok <- switch(
+    pattern,
+    crossing = (hr_pre > 1 && hr_post < 1),
+    diverging = (hr_pre > 0 && hr_post > 0 && hr_post < hr_pre && hr_pre < 1),
+    PH = (hr_pre > 0 && hr_pre < 1 && abs(hr_pre - hr_post) <= tol),
+    diminishing = (hr_pre > 0 && hr_post > 0 && hr_pre < hr_post && hr_post < 1),
+    FALSE
+  )
+  if (!isTRUE(ok)) {
+    stop(
+      "Piecewise log-normal pattern validation failed for ", pattern,
+      ": HR_pre=", hr_pre, ", HR_post=", hr_post
+    )
+  }
+  invisible(TRUE)
+}
+
+validate_piecewise_lognormal_crossing <- function(tab, horizon = 10) {
+  grid <- seq(piecewise_lognormal_change, horizon, length.out = 5001)
+
+  for (i in seq_len(nrow(tab))) {
+    c_mp <- tab$c_meanlog_pre[i]
+    c_sp <- tab$c_sdlog_pre[i]
+    c_mq <- tab$c_meanlog_post[i]
+    c_sq <- tab$c_sdlog_post[i]
+    hp <- tab$hr_pre[i]
+    hq <- tab$hr_post[i]
+
+    Sc <- S_lognormal_piecewise_hr(
+      grid, c_mp, c_sp, c_mq, c_sq,
+      hr_pre = 1, hr_post = 1
+    )
+    St <- S_lognormal_piecewise_hr(
+      grid, c_mp, c_sp, c_mq, c_sq,
+      hr_pre = hp, hr_post = hq
+    )
+    dS <- St - Sc
+
+    has_negative <- any(dS[grid <= piecewise_lognormal_change + 0.05] < -1e-10)
+    has_positive_late <- any(dS[grid > piecewise_lognormal_change + 0.05] > 1e-10)
+    if (!(has_negative && has_positive_late)) {
+      stop(
+        "Crossing survival validation failed for baseline scenario ",
+        tab$scenario_id[i], "."
+      )
+    }
+  }
+  invisible(TRUE)
+}
+
+make_piecewise_lognormal_scenarios <- function(pattern) {
+  if (!pattern %in% names(piecewise_lognormal_effects)) {
+    stop("Unknown piecewise log-normal pattern: ", pattern)
+  }
+
+  eff <- piecewise_lognormal_effects[[pattern]]
+  hp <- unname(eff["hr_pre"])
+  hq <- unname(eff["hr_post"])
+  validate_piecewise_lognormal_hr_pattern(pattern, hp, hq)
+
+  rec_values <- c(3.5, 4.5, 5.5)
+  n_base <- nrow(piecewise_lognormal_baseline)
+
+  tab <- piecewise_lognormal_baseline[
+    rep(seq_len(n_base), each = length(rec_values)),
+    ,
+    drop = FALSE
+  ]
+  rownames(tab) <- NULL
+  tab$rec <- rep(rec_values, times = n_base)
+  tab$scenario_id <- seq_len(nrow(tab))
+
+  tab$pattern <- pattern
+  tab$c_meanlog_pre  <- log(tab$control_pre_median)
+  tab$c_sdlog_pre    <- tab$control_pre_sdlog
+  tab$c_meanlog_post <- log(tab$control_post_median)
+  tab$c_sdlog_post   <- tab$control_post_sdlog
+
+  profile_target_power <- seq(0.62, 0.86, length.out = n_base)
+  profile_effect_strength <- seq(0.72, 1.02, length.out = n_base)
+  tab$target_power <- rep(profile_target_power, each = length(rec_values))
+  tab$effect_strength <- rep(profile_effect_strength, each = length(rec_values))
+  tab$hr_pre  <- 1 + tab$effect_strength * (hp - 1)
+  tab$hr_post <- 1 + tab$effect_strength * (hq - 1)
+
+  if (identical(pattern, "diverging")) {
+    tab$target_power <- pmax(0, tab$target_power - 0.15)
+    tab$hr_pre  <- tab$hr_pre^0.85
+    tab$hr_post <- tab$hr_post^0.85
+  } else if (identical(pattern, "diminishing")) {
+    tab$target_power <- pmin(1, tab$target_power + 0.25)
+    tab$hr_pre  <- tab$hr_pre^1.25
+    tab$hr_post <- tab$hr_post^1.25
+
+    tab$target_power <- pmin(1, tab$target_power + 0.2)
+    tab$hr_pre  <- tab$hr_pre^1.2
+    tab$hr_post <- tab$hr_post^1.2
+  }
+
+  if (identical(pattern, "crossing")) {
+    tab$hr_pre  <- 1 + 0.88 * (tab$hr_pre  - 1)
+    tab$hr_post <- 1 + 0.82 * (tab$hr_post - 1)
+  } else if (identical(pattern, "diverging")) {
+    tab$hr_pre  <- tab$hr_pre^0.95
+    tab$hr_post <- tab$hr_post^0.90
+  } else if (identical(pattern, "PH")) {
+    tab$hr_pre  <- tab$hr_pre^0.82
+    tab$hr_post <- tab$hr_post^0.82
+  } else if (identical(pattern, "diminishing")) {
+    tab$hr_pre  <- tab$hr_pre^0.72
+    tab$hr_post <- tab$hr_post^0.92
+  }
+  tab$target_power <- pmin(0.88, pmax(0.62, tab$target_power))
+
+  if (identical(pattern, "crossing")) {
+    tab$hr_pre  <- tab$hr_pre^1.04
+    tab$hr_post <- tab$hr_post^1.18
+  } else if (identical(pattern, "diverging")) {
+    tab$hr_pre  <- tab$hr_pre^1.03
+    tab$hr_post <- tab$hr_post^1.18
+  } else if (identical(pattern, "PH")) {
+    tab$hr_pre  <- tab$hr_pre^1.08
+    tab$hr_post <- tab$hr_post^1.08
+  } else if (identical(pattern, "diminishing")) {
+    tab$hr_pre  <- tab$hr_pre^1.14
+    tab$hr_post <- tab$hr_post^1.03
+  }
+  if (identical(pattern, "PH")) {
+    tab$hr_pre  <- tab$hr_pre^1.24
+    tab$hr_post <- tab$hr_post^1.24
+  } else if (identical(pattern, "diminishing")) {
+    tab$hr_pre  <- tab$hr_pre^1.20
+    tab$hr_post <- tab$hr_post^1.12
+  }
+
+  if (identical(pattern, "diminishing")) {
+    tab$hr_pre  <- tab$hr_pre^1.20
+    tab$hr_post <- tab$hr_post^1.10
+  }
+
+  if (identical(pattern, "diminishing")) {
+    tab$hr_pre  <- tab$hr_pre^1.10
+    tab$hr_post <- tab$hr_post^1.05
+  }
+
+  .nprof <- length(unique(tab$control_pre_median))
+  .narrow_target <- seq(0.66, 0.82, length.out = .nprof)
+  tab$target_power <- rep(.narrow_target, each = length(rec_values))
+  rm(.nprof, .narrow_target)
+
+  tab$change_control <- piecewise_lognormal_change
+  tab$change_treatment <- piecewise_lognormal_change
+
+  for (.ii in seq_len(nrow(tab))) {
+    validate_piecewise_lognormal_hr_pattern(
+      pattern, tab$hr_pre[.ii], tab$hr_post[.ii]
+    )
+  }
+
+  if (identical(pattern, "crossing")) {
+    validate_piecewise_lognormal_crossing(tab)
+  }
+
+  if (nrow(tab) != 18L ||
+      !identical(sort(unique(tab$rec)), c(3.5, 4.5, 5.5))) {
+    stop("Piecewise log-normal scenario expansion failed: expected 18 rows with each of rec = 3.5, 4.5, 5.5 represented.")
+  }
+
+  tab
+}
+
+piecewise_lognormal_headers <- c(
+  "Type",
+  "Control Rate Assumption", "Treatment Rate Assumption",
+  "Control Meanlog (Pre)", "Control Meanlog (Post)",
+  "Control SDlog (Pre)", "Control SDlog (Post)",
+  "Treatment HR Multiplier (Pre)", "Treatment HR Multiplier (Post)",
+  "Treatment Parameter 3 (Unused)", "Treatment Parameter 4 (Unused)",
+  "Control Change Point", "Treatment Change Point",
+  result_headers[-(1:13)]
+)
+
+save_piecewise_lognormal_result_file <- function(final_sav, file_path,
+                                                 sheet_name = "Sheet 1") {
+  if (nrow(final_sav) > 0) {
+    final_sav <- final_sav[order(
+      final_sav$type,
+      final_sav$c_shape_pre, final_sav$c_shape_post,
+      final_sav$c_scale_pre, final_sav$c_scale_post,
+      final_sav$t_shape_pre, final_sav$t_shape_post,
+      na.last = TRUE
+    ), , drop = FALSE]
+
+    final_sav <- standardize_piecewise_lognormal_export(final_sav, file_path)
+  }
+
+  wb <- if (file.exists(file_path)) loadWorkbook(file_path) else createWorkbook()
+  if (sheet_name %in% names(wb)) removeWorksheet(wb, sheet_name)
+  addWorksheet(wb, sheet_name)
+  if (nrow(final_sav) > 0) writeData(wb, sheet = sheet_name, x = final_sav)
+  saveWorkbook(wb, file = file_path, overwrite = TRUE)
+  cat("Piecewise log-normal Excel file saved to:", file_path, "\n")
+}
+
+check_piecewise_lognormal_original_power <- function(final_sav, pattern) {
+  if (is.null(final_sav) || nrow(final_sav) == 0) return(invisible(NULL))
+
+  nm <- "Original_Power_CHW_No_Resize"
+  if (!nm %in% names(final_sav)) return(invisible(NULL))
+
+  p <- suppressWarnings(as.numeric(final_sav[[nm]]))
+  bad <- is.finite(p) & (p < 0.6 | p >= 0.9)
+  if (any(bad)) {
+    warning(
+      "Observed CHW original power outside requested [0.60, 0.90) for ", pattern,
+      " in ", sum(bad), " row(s). With only ", num_simulations_per_scenario,
+      " simulations per scenario, increase num_simulations_per_scenario before ",
+      "treating this as a calibration failure."
+    )
+  }
+  invisible(NULL)
+}
+
+# Run piecewise log-normal scenarios
+run_piecewise_lognormal_family <- function(extrap_dist, pattern, family_seed,
+                                           num_simulations = 1000, checkpoint_file = NULL) {
+  scenario_table <- make_piecewise_lognormal_scenarios(pattern)
+  final_sav <- data.frame()
+  if (!is.null(checkpoint_file)) save_piecewise_lognormal_result_file(final_sav, checkpoint_file)
+
+  for (j in seq_len(nrow(scenario_table))) {
+    set.seed(family_seed + j - 1L)
+    row <- scenario_table[j, , drop = FALSE]
+
+    c_mp <- row$c_meanlog_pre[[1]]
+    c_sp <- row$c_sdlog_pre[[1]]
+    c_mq <- row$c_meanlog_post[[1]]
+    c_sq <- row$c_sdlog_post[[1]]
+    hp   <- row$hr_pre[[1]]
+    hq   <- row$hr_post[[1]]
+    rec_i <- row$rec[[1]]
+    cpt  <- piecewise_lognormal_change
+
+    gen_c <- function(n) rlognormal_piecewise_hr(
+      n, c_mp, c_sp, c_mq, c_sq,
+      hr_pre = 1, hr_post = 1, c = cpt
+    )
+    gen_t <- function(n) rlognormal_piecewise_hr(
+      n, c_mp, c_sp, c_mq, c_sq,
+      hr_pre = hp, hr_post = hq, c = cpt
+    )
+    S_c <- function(t) S_lognormal_piecewise_hr(
+      t, c_mp, c_sp, c_mq, c_sq,
+      hr_pre = 1, hr_post = 1, c = cpt
+    )
+    S_t <- function(t) S_lognormal_piecewise_hr(
+      t, c_mp, c_sp, c_mq, c_sq,
+      hr_pre = hp, hr_post = hq, c = cpt
+    )
+
+    sav1 <- simu(
+      type = "Unblinded",
+      alpha = 0.05, beta = 0.1,
+      rate1 = 0.6, rate2 = 0.4,
+      c_shape_pre = NA_real_, c_shape_post = NA_real_,
+      c_scale_pre = NA_real_, c_scale_post = NA_real_,
+      t_shape_pre = NA_real_, t_shape_post = NA_real_,
+      t_scale_pre = NA_real_, t_scale_post = NA_real_,
+      change1 = cpt, change2 = cpt,
+      rec = rec_i, CL = 0.2, CU = 0.9,
+      num_simulations = num_simulations,
+      extrap_dist = extrap_dist,
+      event_generator_control = gen_c,
+      event_generator_treatment = gen_t,
+      S_control_override = S_c,
+      S_treatment_override = S_t
+    )
+
+    if (!is.null(sav1) && nrow(sav1) > 0) {
+      sav1$type <- paste0("PiecewiseLogNormal_", pattern, "_", sprintf("%02d", j))
+      sav1$rate1 <- 0.6
+      sav1$rate2 <- 0.4
+      sav1$c_shape_pre  <- c_mp
+      sav1$c_shape_post <- c_mq
+      sav1$c_scale_pre  <- c_sp
+      sav1$c_scale_post <- c_sq
+      sav1$t_shape_pre  <- hp
+      sav1$t_shape_post <- hq
+      sav1$t_scale_pre  <- NA_real_
+      sav1$t_scale_post <- NA_real_
+      sav1$change1 <- cpt
+      sav1$change2 <- cpt
+      final_sav <- rbind(final_sav, sav1)
+      if (!is.null(checkpoint_file)) save_piecewise_lognormal_result_file(final_sav, checkpoint_file)
+    }
+  }
+
+  check_piecewise_lognormal_original_power(final_sav, pattern)
+  final_sav
+}
+
+piecewise_lognormal_definitions <- data.frame(
+  pattern = c("crossing", "diverging", "PH", "diminishing"),
+  seed = c(15234567L, 16234567L, 17234567L, 18234567L),
+  file_stub = c(
+    "H1_Unblinded_crossing_PiecewiseLogNormal",
+    "H1_Unblinded_diverging_PiecewiseLogNormal",
+    "H1_Unblinded_PH_PiecewiseLogNormal",
+    "H1_Unblinded_diminishing_PiecewiseLogNormal"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Generate piecewise log-normal outputs
+run_all_piecewise_lognormal_outputs <- function() {
+  cat("\n============================================================\n")
+  cat("STARTING PIECEWISE LOG-NORMAL OUTPUT GENERATION (c = 1)\n")
+  cat("Exact HR-pattern validation is ON.\n")
+  cat("============================================================\n")
+
+  generated_files <- character(0)
+  for (method_key in names(extrapolation_methods)) {
+    method_label <- unname(extrapolation_methods[method_key])
+
+    for (j in seq_len(nrow(piecewise_lognormal_definitions))) {
+      pattern <- piecewise_lognormal_definitions$pattern[j]
+      final_ln <- run_piecewise_lognormal_family(
+        extrap_dist = method_key,
+        pattern = pattern,
+        family_seed = piecewise_lognormal_definitions$seed[j],
+        num_simulations = num_simulations_per_scenario,
+        checkpoint_file = file.path(
+          directory_path,
+          paste0(piecewise_lognormal_definitions$file_stub[j], "_", method_label, ".xlsx")
+        )
+      )
+
+      file_path <- file.path(
+        directory_path,
+        paste0(piecewise_lognormal_definitions$file_stub[j], "_", method_label, ".xlsx")
+      )
+      save_piecewise_lognormal_result_file(final_ln, file_path)
+      generated_files <- c(generated_files, file_path)
+    }
+  }
+
+  cat("============================================================\n")
+  cat("ALL PIECEWISE LOG-NORMAL OUTPUTS GENERATED\n")
+  cat("Number of added files:", length(generated_files), "\n")
+  cat("============================================================\n")
+  invisible(generated_files)
+}
+
+
+run_all_outputs(output_set = "both")
+```
